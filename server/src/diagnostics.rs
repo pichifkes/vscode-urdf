@@ -1,5 +1,17 @@
+use std::borrow::Cow;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Range};
 use crate::document::Document;
+
+/// Canonical list of Gazebo property element names.
+/// Shared with the completion provider — keep in sync with `known_gazebo_prop`.
+pub const GAZEBO_PROP_NAMES: &[&str] = &[
+    "mu1", "mu2", "mu", "kp", "kd",
+    "maxVel", "minDepth", "maxContacts",
+    "selfCollide", "turnGravityOff", "gravity", "implicitSpringDamper",
+    "dampingFactor", "laserRetro", "material",
+    "stopCfm", "stopErp", "fudgeFactor",
+    "sensor", "plugin",
+];
 
 pub fn check(doc: &Document, text: &str) -> Vec<Diagnostic> {
     let mut diags: Vec<Diagnostic> = Vec::new();
@@ -48,7 +60,7 @@ pub fn check(doc: &Document, text: &str) -> Vec<Diagnostic> {
             }
         }
 
-        // 6. Self-referential joint
+        // Self-referential joint
         if let (Some(p), Some(c)) = (&joint.parent, &joint.child) {
             if p.name == c.name {
                 diags.push(make_diag(
@@ -62,33 +74,40 @@ pub fn check(doc: &Document, text: &str) -> Vec<Diagnostic> {
 
     // 4. Duplicate link names
     {
-        let mut seen: std::collections::HashMap<&str, bool> = std::collections::HashMap::new();
+        let mut seen = std::collections::HashSet::new();
         for item in &doc.links {
-            if seen.contains_key(item.name.as_str()) {
+            if !seen.insert(item.name.as_str()) {
                 diags.push(make_diag(
                     item.range,
                     DiagnosticSeverity::ERROR,
                     format!("Duplicate link name '{}'", item.name),
                 ));
-            } else {
-                seen.insert(item.name.as_str(), true);
             }
         }
     }
 
     // 5. Duplicate joint names
     {
-        let mut seen: std::collections::HashMap<&str, bool> = std::collections::HashMap::new();
+        let mut seen = std::collections::HashSet::new();
         for item in &doc.joints {
-            if seen.contains_key(item.name.as_str()) {
+            if !seen.insert(item.name.as_str()) {
                 diags.push(make_diag(
                     item.range,
                     DiagnosticSeverity::ERROR,
                     format!("Duplicate joint name '{}'", item.name),
                 ));
-            } else {
-                seen.insert(item.name.as_str(), true);
             }
+        }
+    }
+
+    // 6. Gazebo reference must point to a known link or joint
+    for gref in &doc.gazebo_refs {
+        if !link_names.contains(gref.name.as_str()) && !joint_names.contains(gref.name.as_str()) {
+            diags.push(make_diag(
+                gref.range,
+                undef_severity,
+                format!("Undefined link or joint '{}' in gazebo reference", gref.name),
+            ));
         }
     }
 
@@ -103,16 +122,14 @@ pub fn check(doc: &Document, text: &str) -> Vec<Diagnostic> {
             if bytes[i] == b'$' && bytes[i + 1] == b'{' {
                 let start = i;
                 let inner_start = i + 2;
-                // Find closing '}'
                 if let Some(rel) = bytes[inner_start..].iter().position(|&b| b == b'}') {
                     let inner_end = inner_start + rel;
                     let varname = &text[inner_start..inner_end];
-                    // Skip empty or varnames with spaces
                     if !varname.is_empty()
                         && !varname.contains(|c: char| matches!(c, ' ' | '+' | '-' | '*' | '/' | '(' | ')' | '.'))
                     {
                         if !prop_names.contains(varname) {
-                            let end = inner_end + 1; // past '}'
+                            let end = inner_end + 1;
                             let range = byte_range_to_lsp(text, start..end);
                             diags.push(make_diag(
                                 range,
@@ -136,13 +153,7 @@ pub fn check(doc: &Document, text: &str) -> Vec<Diagnostic> {
 // Schema validation: unknown element names and unknown attributes
 // ---------------------------------------------------------------------------
 
-pub fn check_schema(text: &str) -> Vec<Diagnostic> {
-    let xml = match roxmltree::Document::parse(text) {
-        Ok(d) => d,
-        Err(_) => return vec![], // XML errors already reported by document::parse
-    };
-
-    // Collect xacro property values so simple ${varname} can be type-checked
+pub fn check_schema(xml: &roxmltree::Document, text: &str) -> Vec<Diagnostic> {
     let mut props: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for node in xml.root_element().children() {
         if node.is_element() {
@@ -186,20 +197,14 @@ fn walk_schema(
     }
 
     let tag = node.tag_name().name();
-    let ns = node.tag_name().namespace();
-
-    // xacro namespace elements are always valid
-    let is_xacro = ns.map_or(false, |n| n.contains("xacro")) || tag.starts_with("xacro:");
-
-    // Don't validate inside gazebo/plugin/transmission — they accept arbitrary XML
-    let child_skip = skip || is_xacro || matches!(tag, "gazebo" | "plugin" | "sensor" | "transmission");
+    let is_xacro = is_xacro_element(&node);
+    let child_skip = skip || is_xacro || matches!(tag, "plugin" | "sensor" | "transmission");
 
     if !skip && !is_xacro {
         match known_urdf_attrs(tag) {
             Some(valid_attrs) => {
                 for attr in node.attributes() {
                     let aname = attr.name();
-                    // skip XML namespace declarations
                     if aname == "xmlns" || aname.starts_with("xmlns:") {
                         continue;
                     }
@@ -213,7 +218,6 @@ fn walk_schema(
                     }
                 }
 
-                // Check 1: required attributes
                 for req in required_urdf_attrs(tag) {
                     if node.attribute(*req).is_none() {
                         let range = elem_name_range(text, &node);
@@ -225,7 +229,6 @@ fn walk_schema(
                     }
                 }
 
-                // Check 2: attribute value types
                 for attr in node.attributes() {
                     let aname = attr.name();
                     if aname == "xmlns" || aname.starts_with("xmlns:") {
@@ -248,8 +251,105 @@ fn walk_schema(
         }
     }
 
-    for child in node.children() {
-        walk_schema(child, text, diags, child_skip, props);
+    if tag == "gazebo" && !skip && !is_xacro {
+        for child in node.children() {
+            walk_gazebo_child(child, text, diags, props);
+        }
+    } else {
+        for child in node.children() {
+            walk_schema(child, text, diags, child_skip, props);
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+enum GazeboPropKind {
+    Float,
+    NonNegFloat,
+    PositiveFloat,
+    Bool,
+    Int,
+    AnyString,
+    Lenient,
+}
+
+fn known_gazebo_prop(tag: &str) -> Option<GazeboPropKind> {
+    match tag {
+        "mu1" | "mu2" | "mu"                          => Some(GazeboPropKind::NonNegFloat),
+        "kp" | "kd"                                   => Some(GazeboPropKind::PositiveFloat),
+        "maxVel" | "minDepth" | "stopCfm" | "stopErp" => Some(GazeboPropKind::NonNegFloat),
+        "dampingFactor" | "laserRetro" | "fudgeFactor" => Some(GazeboPropKind::Float),
+        "maxContacts"                                  => Some(GazeboPropKind::Int),
+        "selfCollide" | "turnGravityOff" | "gravity"
+        | "implicitSpringDamper"                       => Some(GazeboPropKind::Bool),
+        "material"                                     => Some(GazeboPropKind::AnyString),
+        "sensor" | "plugin"                            => Some(GazeboPropKind::Lenient),
+        _                                              => None,
+    }
+}
+
+fn walk_gazebo_child(
+    node: roxmltree::Node,
+    text: &str,
+    diags: &mut Vec<Diagnostic>,
+    props: &std::collections::HashMap<&str, &str>,
+) {
+    if !node.is_element() || is_xacro_element(&node) {
+        return;
+    }
+    let tag = node.tag_name().name();
+    match known_gazebo_prop(tag) {
+        None => {
+            let range = elem_name_range(text, &node);
+            diags.push(make_diag(
+                range,
+                DiagnosticSeverity::WARNING,
+                format!("Unknown Gazebo property <{tag}>"),
+            ));
+        }
+        Some(GazeboPropKind::Lenient) => {}
+        Some(kind) => {
+            let mut text_content = String::new();
+            let mut text_range: Option<std::ops::Range<usize>> = None;
+            for child in node.children() {
+                if child.is_text() {
+                    let t = child.text().unwrap_or("");
+                    if !t.trim().is_empty() {
+                        text_content.push_str(t);
+                        text_range = Some(child.range());
+                    }
+                }
+            }
+            let content = text_content.trim();
+            if !content.is_empty() {
+                if let Some(tr) = text_range {
+                    if let Some(msg) = validate_gazebo_text(tag, content, kind, props) {
+                        diags.push(make_diag(byte_range_to_lsp(text, tr), DiagnosticSeverity::ERROR, msg));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validate_gazebo_text(
+    tag: &str,
+    content: &str,
+    kind: GazeboPropKind,
+    props: &std::collections::HashMap<&str, &str>,
+) -> Option<String> {
+    let effective = resolve_effective(content, props)?;
+    match kind {
+        GazeboPropKind::Float         => expect_float(&effective, tag),
+        GazeboPropKind::NonNegFloat   => expect_non_neg_float(&effective, tag),
+        GazeboPropKind::PositiveFloat => expect_positive_float(&effective, tag),
+        GazeboPropKind::Bool          => expect_bool(&effective, tag),
+        GazeboPropKind::Int           => {
+            if effective.trim().parse::<i64>().is_err() {
+                Some(format!("'{tag}' must be an integer, got '{}'", effective.trim()))
+            } else { None }
+        }
+        GazeboPropKind::AnyString | GazeboPropKind::Lenient => None,
     }
 }
 
@@ -277,33 +377,17 @@ fn validate_attr_value(
     value: &str,
     props: &std::collections::HashMap<&str, &str>,
 ) -> Option<String> {
-    // If the value contains xacro substitutions, try to resolve a simple
-    // ${varname} to its property value. If resolution fails or the expression
-    // is complex (operators, multiple vars), skip type checking entirely.
-    let resolved;
-    let effective: &str = if value.contains("${") {
-        if let Some(v) = resolve_simple_xacro(value, props) {
-            resolved = v;
-            &resolved
-        } else {
-            return None;
-        }
-    } else {
-        value
-    };
+    let effective = resolve_effective(value, props)?;
     match (element, attr) {
-        // 3 floats
-        (_, "xyz") | (_, "rpy") => expect_n_floats(effective, 3, attr),
-        // 3 positive floats
-        ("box", "size") => expect_n_floats(effective, 3, attr)
+        (_, "xyz") | (_, "rpy") => expect_n_floats(&effective, 3, attr),
+        ("box", "size") => expect_n_floats(&effective, 3, attr)
             .or_else(|| {
                 let ok = effective.split_whitespace()
                     .filter_map(|s| s.parse::<f64>().ok())
                     .all(|f| f > 0.0);
                 if !ok { Some("'size' values must be positive".to_string()) } else { None }
             }),
-        // 4 floats in [0, 1]
-        ("color", "rgba") => expect_n_floats(effective, 4, attr)
+        ("color", "rgba") => expect_n_floats(&effective, 4, attr)
             .or_else(|| {
                 let vals: Vec<f64> = effective.split_whitespace()
                     .filter_map(|s| s.parse().ok())
@@ -312,40 +396,51 @@ fn validate_attr_value(
                     Some("'rgba' values must be between 0 and 1".into())
                 } else { None }
             }),
-        // single positive float
-        (_, "radius") | ("cylinder", "length") => expect_positive_float(effective, attr),
-        // single float (can be negative)
+        (_, "radius") | ("cylinder", "length") => expect_positive_float(&effective, attr),
         (_, "lower") | (_, "upper") | (_, "effort") | (_, "velocity")
         | (_, "damping") | (_, "friction") | (_, "value")
         | (_, "ixx") | (_, "ixy") | (_, "ixz") | (_, "iyy") | (_, "iyz") | (_, "izz")
-        | (_, "multiplier") | (_, "offset") => expect_float(effective, attr),
+        | (_, "multiplier") | (_, "offset") => expect_float(&effective, attr),
         _ => None,
     }
 }
 
-/// Resolve `${varname}` to its property value when the substitution is a single
-/// simple identifier (no operators, spaces, or parentheses). Returns None for
-/// complex expressions or unresolvable names — caller should skip type checking.
-fn resolve_simple_xacro<'a>(
+/// Resolves xacro `${varname}` to the property value for simple single-identifier
+/// substitutions. Returns `None` to signal "skip validation" when a `${` pattern
+/// is present but unresolvable. Non-xacro values pass through as `Borrowed`.
+fn resolve_effective<'a>(
+    value: &'a str,
+    props: &std::collections::HashMap<&str, &str>,
+) -> Option<Cow<'a, str>> {
+    if value.contains("${") {
+        resolve_simple_xacro(value, props).map(Cow::Owned)
+    } else {
+        Some(Cow::Borrowed(value))
+    }
+}
+
+fn resolve_simple_xacro(
     value: &str,
-    props: &'a std::collections::HashMap<&str, &str>,
+    props: &std::collections::HashMap<&str, &str>,
 ) -> Option<String> {
     let v = value.trim();
-    // Must be exactly ${varname} with nothing else
     if !v.starts_with("${") || !v.ends_with('}') {
         return None;
     }
     let inner = &v[2..v.len() - 1];
-    // Reject expressions — anything with operators or whitespace
     if inner.contains(|c: char| matches!(c, '+' | '-' | '*' | '/' | '(' | ')' | ' ' | '\t')) {
         return None;
     }
     let resolved = props.get(inner)?;
-    // Don't recurse into nested xacro expressions
     if resolved.contains("${") {
         return None;
     }
     Some(resolved.to_string())
+}
+
+fn is_xacro_element(node: &roxmltree::Node) -> bool {
+    node.tag_name().namespace().map_or(false, |n| n.contains("xacro"))
+        || node.tag_name().name().starts_with("xacro:")
 }
 
 fn expect_n_floats(value: &str, n: usize, attr: &str) -> Option<String> {
@@ -375,6 +470,22 @@ fn expect_positive_float(value: &str, attr: &str) -> Option<String> {
         Ok(f) if f > 0.0 => None,
         Ok(_) => Some(format!("'{attr}' must be positive")),
         Err(_) => Some(format!("'{attr}' must be a number, got '{trimmed}'")),
+    }
+}
+
+fn expect_non_neg_float(value: &str, attr: &str) -> Option<String> {
+    let trimmed = value.trim();
+    match trimmed.parse::<f64>() {
+        Ok(f) if f >= 0.0 => None,
+        Ok(_) => Some(format!("'{attr}' must be non-negative")),
+        Err(_) => Some(format!("'{attr}' must be a number, got '{trimmed}'")),
+    }
+}
+
+fn expect_bool(value: &str, attr: &str) -> Option<String> {
+    match value.trim() {
+        "true" | "false" | "1" | "0" => None,
+        v => Some(format!("'{attr}' must be 'true' or 'false', got '{v}'")),
     }
 }
 
@@ -411,14 +522,12 @@ fn known_urdf_attrs(element: &str) -> Option<&'static [&'static str]> {
     }
 }
 
-/// Range covering the tag name in the opening tag (e.g. `bosx` in `<bosx ...>`).
 fn elem_name_range(text: &str, node: &roxmltree::Node) -> Range {
     let start = node.range().start + 1; // skip '<'
     let name = node.tag_name().name();
     byte_range_to_lsp(text, start..start + name.len())
 }
 
-/// Range covering the attribute name within the element source.
 fn attr_name_range(text: &str, node: &roxmltree::Node, attr_name: &str) -> Range {
     let elem_range = node.range();
     let elem_src = &text[elem_range.clone()];
@@ -438,7 +547,7 @@ fn attr_name_range(text: &str, node: &roxmltree::Node, attr_name: &str) -> Range
         }
         search = abs + 1;
     }
-    elem_name_range(text, node) // fallback
+    elem_name_range(text, node)
 }
 
 fn make_diag(range: Range, severity: DiagnosticSeverity, message: String) -> Diagnostic {
@@ -451,21 +560,6 @@ fn make_diag(range: Range, severity: DiagnosticSeverity, message: String) -> Dia
     }
 }
 
-fn byte_offset_to_position(text: &str, offset: usize) -> tower_lsp::lsp_types::Position {
-    let safe_offset = offset.min(text.len());
-    let before = &text[..safe_offset];
-    let line = before.bytes().filter(|&b| b == b'\n').count();
-    let last_newline = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
-    let character = before[last_newline..].chars().count();
-    tower_lsp::lsp_types::Position {
-        line: line as u32,
-        character: character as u32,
-    }
-}
-
 fn byte_range_to_lsp(text: &str, range: std::ops::Range<usize>) -> Range {
-    Range {
-        start: byte_offset_to_position(text, range.start),
-        end: byte_offset_to_position(text, range.end),
-    }
+    crate::document::byte_range_to_lsp(text, range)
 }

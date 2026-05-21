@@ -151,7 +151,9 @@ impl Backend {
     async fn validate(&self, uri: Url, text: String) {
         let (doc, mut diags) = document::parse(&text);
         diags.extend(diagnostics::check(&doc, &text));
-        diags.extend(diagnostics::check_schema(&text));
+        if let Ok(ref xml) = roxmltree::Document::parse(&text) {
+            diags.extend(diagnostics::check_schema(xml, &text));
+        }
         {
             let mut map = self.docs.lock().await;
             map.insert(uri.clone(), (doc, text));

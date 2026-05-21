@@ -1,8 +1,6 @@
-#![allow(dead_code, unused_imports)]
-
 use tower_lsp::lsp_types::*;
 
-use crate::document::{Document, Joint, NamedItem, NameRef};
+use crate::document::Document;
 
 // ---------------------------------------------------------------------------
 // Helper
@@ -388,7 +386,6 @@ pub fn rename(doc: &Document, pos: Position, new_name: &str) -> Vec<(Range, Stri
 // ---------------------------------------------------------------------------
 
 pub fn completion(doc: &Document, pos: Position, text: &str) -> Vec<CompletionItem> {
-    // Extract the portion of the current line up to the cursor column.
     let line_text: &str = text
         .lines()
         .nth(pos.line as usize)
@@ -400,12 +397,10 @@ pub fn completion(doc: &Document, pos: Position, text: &str) -> Vec<CompletionIt
         line_text
     };
 
-    // link="<partial>  → offer link names
-    let link_re = regex_match(prefix, r#"link\s*=\s*"[^"]*$"#);
-    // joint="<partial> → offer joint names
-    let joint_re = regex_match(prefix, r#"joint\s*=\s*"[^"]*$"#);
-    // ${<partial>      → offer xacro property names
-    let xacro_re = regex_match(prefix, r#"\$\{[^}]*$"#);
+    let link_re      = regex_match(prefix, r#"link\s*=\s*"[^"]*$"#);
+    let joint_re     = regex_match(prefix, r#"joint\s*=\s*"[^"]*$"#);
+    let reference_re = regex_match(prefix, r#"reference\s*=\s*"[^"]*$"#);
+    let xacro_re     = regex_match(prefix, r#"\$\{[^}]*$"#);
 
     if link_re {
         doc.links
@@ -425,6 +420,22 @@ pub fn completion(doc: &Document, pos: Position, text: &str) -> Vec<CompletionIt
                 ..CompletionItem::default()
             })
             .collect()
+    } else if reference_re {
+        doc.links
+            .iter()
+            .map(|l| CompletionItem {
+                label: l.name.clone(),
+                kind: Some(CompletionItemKind::REFERENCE),
+                detail: Some("link".to_string()),
+                ..CompletionItem::default()
+            })
+            .chain(doc.joints.iter().map(|j| CompletionItem {
+                label: j.name.clone(),
+                kind: Some(CompletionItemKind::REFERENCE),
+                detail: Some("joint".to_string()),
+                ..CompletionItem::default()
+            }))
+            .collect()
     } else if xacro_re {
         doc.xacro_properties
             .iter()
@@ -435,29 +446,34 @@ pub fn completion(doc: &Document, pos: Position, text: &str) -> Vec<CompletionIt
             })
             .collect()
     } else {
-        vec![]
+        // <partial inside a <gazebo> block → offer Gazebo property element names
+        let cursor_offset: usize = text
+            .lines()
+            .take(pos.line as usize)
+            .map(|l| l.len() + 1)
+            .sum::<usize>()
+            + col.min(line_text.len());
+        if inside_gazebo_block(text, cursor_offset) && is_element_name_trigger(prefix) {
+            crate::diagnostics::GAZEBO_PROP_NAMES
+                .iter()
+                .map(|name| CompletionItem {
+                    label: name.to_string(),
+                    kind: Some(CompletionItemKind::PROPERTY),
+                    ..CompletionItem::default()
+                })
+                .collect()
+        } else {
+            vec![]
+        }
     }
 }
 
-/// Minimal regex-free pattern matching for the three completion triggers.
-/// Rather than pulling in the `regex` crate (not in Cargo.toml), we use
-/// simple string searches that are equivalent for our well-defined patterns.
-///
-/// Pattern semantics:
-///   `link\s*=\s*"[^"]*$`  → the prefix ends with  link="…  (no closing quote)
-///   `joint\s*=\s*"[^"]*$` → the prefix ends with  joint="…
-///   `\$\{[^}]*$`          → the prefix ends with  ${…  (no closing brace)
 fn regex_match(prefix: &str, pattern: &str) -> bool {
     match pattern {
-        r#"link\s*=\s*"[^"]*$"# => {
-            // Find last occurrence of `link` followed (with optional spaces) by `="`
-            find_attr_open(prefix, "link")
-        }
-        r#"joint\s*=\s*"[^"]*$"# => {
-            find_attr_open(prefix, "joint")
-        }
+        r#"link\s*=\s*"[^"]*$"#      => find_attr_open(prefix, "link"),
+        r#"joint\s*=\s*"[^"]*$"#     => find_attr_open(prefix, "joint"),
+        r#"reference\s*=\s*"[^"]*$"# => find_attr_open(prefix, "reference"),
         r#"\$\{[^}]*$"# => {
-            // There must be a `${` after the last `}` (if any)
             if let Some(open) = prefix.rfind("${") {
                 let close = prefix.rfind('}').unwrap_or(0);
                 open > close
@@ -495,5 +511,29 @@ fn find_attr_open(prefix: &str, attr: &str) -> bool {
         if search.is_empty() {
             return false;
         }
+    }
+}
+
+/// True when the cursor byte offset falls inside an open `<gazebo …>` block.
+fn inside_gazebo_block(text: &str, offset: usize) -> bool {
+    let before = &text[..offset.min(text.len())];
+    let last_open  = before.rfind("<gazebo");
+    let last_close = before.rfind("</gazebo");
+    match (last_open, last_close) {
+        (Some(open), Some(close)) => open > close,
+        (Some(_), None)           => true,
+        _                         => false,
+    }
+}
+
+/// True when the line prefix ends with `<` or `<partial_identifier` (element-name
+/// trigger) but not a closing tag (`</`).
+fn is_element_name_trigger(prefix: &str) -> bool {
+    let trimmed = prefix.trim_end();
+    if let Some(lt) = trimmed.rfind('<') {
+        let after = &trimmed[lt + 1..];
+        !after.starts_with('/') && after.chars().all(|c| c.is_alphanumeric() || c == '_')
+    } else {
+        false
     }
 }

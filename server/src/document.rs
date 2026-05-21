@@ -6,6 +6,8 @@ pub struct Document {
     pub joints: Vec<Joint>,
     pub materials: Vec<NamedItem>,
     pub xacro_properties: Vec<NamedItem>,
+    /// `reference` attribute values from `<gazebo reference="...">` elements.
+    pub gazebo_refs: Vec<NameRef>,
     /// True when the root element declares xmlns:xacro — indicates a xacro fragment
     /// where some links/joints may be defined in included files.
     pub is_xacro: bool,
@@ -39,6 +41,7 @@ pub fn parse(text: &str) -> (Document, Vec<Diagnostic>) {
         joints: Vec::new(),
         materials: Vec::new(),
         xacro_properties: Vec::new(),
+        gazebo_refs: Vec::new(),
         is_xacro: false,
     };
 
@@ -148,6 +151,15 @@ pub fn parse(text: &str) -> (Document, Vec<Diagnostic>) {
                     });
                 }
             }
+            "gazebo" => {
+                if let Some(reference) = node.attribute("reference") {
+                    let range = attr_value_range(text, &node, "reference");
+                    doc.gazebo_refs.push(NameRef {
+                        name: reference.to_string(),
+                        range,
+                    });
+                }
+            }
             _ => {
                 // xacro:property — tag name includes the namespace prefix in roxmltree
                 // The tag_name().name() strips the namespace, so we check the full name
@@ -230,7 +242,7 @@ fn attr_value_range(text: &str, node: &roxmltree::Node, attr_name: &str) -> Rang
     }
 }
 
-fn byte_offset_to_position(text: &str, offset: usize) -> Position {
+pub(crate) fn byte_offset_to_position(text: &str, offset: usize) -> Position {
     let safe_offset = offset.min(text.len());
     let before = &text[..safe_offset];
     let line = before.bytes().filter(|&b| b == b'\n').count();
@@ -242,7 +254,7 @@ fn byte_offset_to_position(text: &str, offset: usize) -> Position {
     }
 }
 
-fn byte_range_to_lsp(text: &str, range: std::ops::Range<usize>) -> Range {
+pub(crate) fn byte_range_to_lsp(text: &str, range: std::ops::Range<usize>) -> Range {
     Range {
         start: byte_offset_to_position(text, range.start),
         end: byte_offset_to_position(text, range.end),
