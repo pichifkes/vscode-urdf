@@ -127,8 +127,18 @@ pub fn check(doc: &Document, text: &str) -> Vec<Diagnostic> {
             if bytes[i] == b'$' && bytes[i + 1] == b'{' {
                 let start = i;
                 let inner_start = i + 2;
-                if let Some(rel) = bytes[inner_start..].iter().position(|&b| b == b'}') {
-                    let inner_end = inner_start + rel;
+                // Scan for closing '}', aborting at attribute/element boundaries so
+                // an unclosed ${... doesn't silently swallow the rest of the file.
+                let mut j = inner_start;
+                let mut close: Option<usize> = None;
+                while j < bytes.len() {
+                    match bytes[j] {
+                        b'}' => { close = Some(j); break; }
+                        b'"' | b'\'' | b'<' | b'\n' => break,
+                        _ => j += 1,
+                    }
+                }
+                if let Some(inner_end) = close {
                     let varname = &text[inner_start..inner_end];
                     if !varname.is_empty()
                         && !varname.contains(|c: char| matches!(c, ' ' | '+' | '-' | '*' | '/' | '(' | ')' | '.'))
@@ -144,8 +154,16 @@ pub fn check(doc: &Document, text: &str) -> Vec<Diagnostic> {
                         }
                     }
                     i = inner_end + 1;
-                    continue;
+                } else {
+                    let range = byte_range_to_lsp(text, start..j);
+                    diags.push(make_diag(
+                        range,
+                        DiagnosticSeverity::ERROR,
+                        "Unclosed xacro expression: missing '}'".to_string(),
+                    ));
+                    i = j;
                 }
+                continue;
             }
             i += 1;
         }
@@ -756,6 +774,40 @@ mod tests {
         assert!(diags.iter().any(|d| d.message.contains("never closed") || d.message.contains("Mismatched")),
             "expected unclosed/mismatch diagnostic, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn unclosed_xacro_expression_is_flagged() {
+        let text = r#"<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="r">
+  <xacro:property name="wheel_thickness" value="0.026"/>
+  <link name="x"><visual><geometry>
+    <cylinder radius="${asaso" length="${wheel_thickness}"/>
+  </geometry></visual></link>
+</robot>"#;
+        let (doc, mut d) = document::parse(text);
+        d.extend(check(&doc, text));
+        assert!(d.iter().any(|m| m.message.contains("Unclosed xacro expression")),
+            "expected unclosed-expression diagnostic, got: {:?}",
+            d.iter().map(|x| &x.message).collect::<Vec<_>>());
+        // wheel_thickness should NOT be flagged as undefined
+        assert!(!d.iter().any(|m| m.message.contains("wheel_thickness") && m.message.contains("Undefined")),
+            "wheel_thickness should not be flagged");
+    }
+
+    #[test]
+    fn completion_inside_dollar_brace() {
+        use tower_lsp::lsp_types::Position;
+        let text = "<robot xmlns:xacro=\"http://www.ros.org/wiki/xacro\" name=\"r\">\n  <xacro:property name=\"wheel_radius\" value=\"0.033\"/>\n  <xacro:property name=\"wheel_thickness\" value=\"0.026\"/>\n  <link name=\"x\"><visual><geometry>\n    <cylinder radius=\"${w}\" length=\"0\"/>\n  </geometry></visual></link>\n</robot>";
+        let (doc, _) = document::parse(text);
+        // Line 4 (0-indexed): "    <cylinder radius=\"${w}\" length=\"0\"/>"
+        // Cursor right after the 'w' (before the closing '}')
+        let line = "    <cylinder radius=\"${w}\" length=\"0\"/>";
+        let col_after_w = line.find("${w").unwrap() + 3; // position right after 'w'
+        let pos = Position::new(4, col_after_w as u32);
+        let items = crate::features::completion(&doc, pos, text);
+        let labels: Vec<&str> = items.iter().map(|c| c.label.as_str()).collect();
+        assert!(labels.contains(&"wheel_radius"), "expected wheel_radius in completions, got: {:?}", labels);
+        assert!(labels.contains(&"wheel_thickness"), "expected wheel_thickness in completions, got: {:?}", labels);
     }
 
     #[test]
