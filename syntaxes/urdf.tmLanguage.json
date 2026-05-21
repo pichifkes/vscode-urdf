@@ -51,14 +51,14 @@
         },
         "tag-name": {
             "patterns": [
-                { "match": "^xacro:[A-Za-z_][\\w_]*$", "name": "entity.name.function.xacro" },
-                { "match": "^(robot|link|joint|transmission|gazebo)$", "name": "keyword.control.urdf" },
-                { "match": "^(parent|child|mimic)$", "name": "variable.parameter.urdf" },
-                { "match": "^(visual|collision|inertial|geometry|origin|axis|limit|dynamics|safety_controller|calibration)$", "name": "storage.type.urdf" },
-                { "match": "^(material|color|texture)$", "name": "support.class.material.urdf" },
-                { "match": "^(mass|inertia)$", "name": "support.function.inertial.urdf" },
-                { "match": "^(box|cylinder|sphere|mesh)$", "name": "support.type.urdf" },
-                { "match": "^(mu1|mu2|mu|kp|kd|maxVel|minDepth|maxContacts|selfCollide|turnGravityOff|gravity|implicitSpringDamper|dampingFactor|laserRetro|stopCfm|stopErp|fudgeFactor)$", "name": "support.constant.gazebo" },
+                { "match": "\\Axacro:[A-Za-z_]\\w*\\z", "name": "entity.name.function.xacro" },
+                { "match": "\\A(robot|link|joint|transmission|gazebo)\\z", "name": "keyword.control.urdf" },
+                { "match": "\\A(parent|child|mimic)\\z", "name": "variable.parameter.urdf" },
+                { "match": "\\A(visual|collision|inertial|geometry|origin|axis|limit|dynamics|safety_controller|calibration)\\z", "name": "storage.type.urdf" },
+                { "match": "\\A(material|color|texture)\\z", "name": "support.class.material.urdf" },
+                { "match": "\\A(mass|inertia)\\z", "name": "support.function.inertial.urdf" },
+                { "match": "\\A(box|cylinder|sphere|mesh)\\z", "name": "support.type.urdf" },
+                { "match": "\\A(mu1|mu2|mu|kp|kd|maxVel|minDepth|maxContacts|selfCollide|turnGravityOff|gravity|implicitSpringDamper|dampingFactor|laserRetro|stopCfm|stopErp|fudgeFactor)\\z", "name": "support.constant.gazebo" },
                 { "match": ".+", "name": "entity.name.tag.xml" }
             ]
         },
@@ -77,7 +77,7 @@
         },
         "attribute-name": {
             "patterns": [
-                { "match": "^(name|link|joint|type|reference|rgba|xyz|rpy|size|radius|length|filename|scale|value|lower|upper|effort|velocity|damping|friction|multiplier|offset|ixx|ixy|ixz|iyy|iyz|izz|mass|x|y|z)$", "name": "entity.other.attribute-name.urdf" },
+                { "match": "\\A(name|link|joint|type|reference|rgba|xyz|rpy|size|radius|length|filename|scale|value|lower|upper|effort|velocity|damping|friction|multiplier|offset|ixx|ixy|ixz|iyy|iyz|izz|mass|x|y|z)\\z", "name": "entity.other.attribute-name.urdf" },
                 { "match": ".+", "name": "entity.other.attribute-name.xml" }
             ]
         },
