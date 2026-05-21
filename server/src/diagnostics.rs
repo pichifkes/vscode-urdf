@@ -736,6 +736,29 @@ mod tests {
     }
 
     #[test]
+    fn tag_mismatch_points_to_opening_tag() {
+        // The misspelled opening tag is on line 1 (0-indexed), the closing tag matches
+        // the original name. The diagnostic should be on the opening tag, not the closing.
+        let text = "<robot name=\"r\">\n  <mateaaaaaaa name=\"x\">\n    <color rgba=\"1 1 1 1\"/>\n  </material>\n</robot>\n";
+        let (_, diags) = document::parse(text);
+        assert_eq!(diags.len(), 1, "expected exactly one diagnostic, got {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+        assert!(diags[0].message.contains("mateaaaaaaa") && diags[0].message.contains("material"),
+            "expected mismatch message naming both tags, got: {}", diags[0].message);
+        assert_eq!(diags[0].range.start.line, 1, "expected diagnostic on the opening tag line, got: {:?}",
+            diags[0].range);
+    }
+
+    #[test]
+    fn tag_unclosed_points_to_opening() {
+        let text = "<robot>\n  <link name=\"foo\">\n</robot>\n";
+        let (_, diags) = document::parse(text);
+        assert!(diags.iter().any(|d| d.message.contains("never closed") || d.message.contains("Mismatched")),
+            "expected unclosed/mismatch diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn tree_valid_chain() {
         let msgs = diag_messages(r#"<?xml version="1.0"?><robot name="r">
           <link name="base_link"/>

@@ -48,6 +48,14 @@ pub fn parse(text: &str) -> (Document, Vec<Diagnostic>) {
     let xml = match roxmltree::Document::parse(text) {
         Ok(d) => d,
         Err(e) => {
+            // Tag-balance scanner: when XML parsing fails, try to identify
+            // mismatched/unclosed tags ourselves so the diagnostic points at
+            // the actual misspelled opening tag, not the closing tag where
+            // roxmltree first noticed the inconsistency.
+            let balance_diags = scan_tag_balance(text);
+            if !balance_diags.is_empty() {
+                return (doc, balance_diags);
+            }
             let msg = e.to_string();
             let (line, col) = parse_xml_error_pos(&msg);
             let pos = Position::new(line, col);
@@ -191,6 +199,173 @@ pub fn parse(text: &str) -> (Document, Vec<Diagnostic>) {
 
 /// Parse a row:col prefix from roxmltree error messages (e.g. "9:5 unexpected close tag").
 /// Returns 0-indexed (line, character). Falls back to (0, 0) if the format doesn't match.
+/// Walk the document tracking opening/closing tag balance. Returns a single
+/// diagnostic positioned on the actual misspelled (or unclosed) opening tag,
+/// rather than at the closing tag where the inconsistency was detected.
+/// Used as a fallback when roxmltree::Document::parse fails.
+fn scan_tag_balance(text: &str) -> Vec<Diagnostic> {
+    let bytes = text.as_bytes();
+    // Stack entries: (tag name, byte start of name, byte end of name)
+    let mut stack: Vec<(&str, usize, usize)> = Vec::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= bytes.len() {
+            break;
+        }
+
+        // <?xml … ?>  or  <?target …?>
+        if bytes[i] == b'?' {
+            i += 1;
+            while i + 1 < bytes.len() && !(bytes[i] == b'?' && bytes[i + 1] == b'>') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+
+        if bytes[i] == b'!' {
+            // Comment <!-- … -->
+            if i + 2 < bytes.len() && bytes[i + 1] == b'-' && bytes[i + 2] == b'-' {
+                i += 3;
+                while i + 2 < bytes.len()
+                    && !(bytes[i] == b'-' && bytes[i + 1] == b'-' && bytes[i + 2] == b'>')
+                {
+                    i += 1;
+                }
+                i = (i + 3).min(bytes.len());
+                continue;
+            }
+            // CDATA <![CDATA[ … ]]>
+            if i + 7 < bytes.len() && &bytes[i + 1..i + 8] == b"[CDATA[" {
+                i += 8;
+                while i + 2 < bytes.len()
+                    && !(bytes[i] == b']' && bytes[i + 1] == b']' && bytes[i + 2] == b'>')
+                {
+                    i += 1;
+                }
+                i = (i + 3).min(bytes.len());
+                continue;
+            }
+            // DOCTYPE or any other declaration — skip to '>'
+            while i < bytes.len() && bytes[i] != b'>' {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+            continue;
+        }
+
+        // Closing tag </name>
+        if bytes[i] == b'/' {
+            i += 1;
+            let name_start = i;
+            while i < bytes.len() && is_name_char(bytes[i]) {
+                i += 1;
+            }
+            let name_end = i;
+            let name = &text[name_start..name_end];
+            while i < bytes.len() && bytes[i] != b'>' {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+
+            match stack.pop() {
+                Some((open_name, _, _)) if open_name == name => {}
+                Some((open_name, open_ns, open_ne)) => {
+                    return vec![diag_at(
+                        text,
+                        open_ns..open_ne,
+                        format!(
+                            "Mismatched tag: opened <{open_name}> but closed with </{name}>"
+                        ),
+                    )];
+                }
+                None => {
+                    return vec![diag_at(
+                        text,
+                        name_start..name_end,
+                        format!("Closing tag </{name}> has no matching opening tag"),
+                    )];
+                }
+            }
+            continue;
+        }
+
+        // Opening tag <name …>  or  <name … />
+        let name_start = i;
+        while i < bytes.len() && is_name_char(bytes[i]) {
+            i += 1;
+        }
+        let name_end = i;
+        let name = &text[name_start..name_end];
+        if name.is_empty() {
+            continue;
+        }
+
+        // Walk to '>' or '/>', honouring quoted attribute values.
+        let mut self_closing = false;
+        let mut in_quote: Option<u8> = None;
+        while i < bytes.len() {
+            let b = bytes[i];
+            match in_quote {
+                Some(q) if b == q => in_quote = None,
+                Some(_) => {}
+                None => {
+                    if b == b'"' || b == b'\'' {
+                        in_quote = Some(b);
+                    } else if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
+                        self_closing = true;
+                        i += 2;
+                        break;
+                    } else if b == b'>' {
+                        i += 1;
+                        break;
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        if !self_closing {
+            stack.push((name, name_start, name_end));
+        }
+    }
+
+    // Anything left on the stack is an unclosed tag.
+    if let Some(&(open_name, open_ns, open_ne)) = stack.last() {
+        return vec![diag_at(
+            text,
+            open_ns..open_ne,
+            format!("Tag <{open_name}> is never closed"),
+        )];
+    }
+
+    Vec::new()
+}
+
+fn is_name_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b':' | b'-' | b'.')
+}
+
+fn diag_at(text: &str, range: std::ops::Range<usize>, msg: String) -> Diagnostic {
+    Diagnostic {
+        range: byte_range_to_lsp(text, range),
+        severity: Some(DiagnosticSeverity::ERROR),
+        source: Some("urdf-lsp".into()),
+        message: msg,
+        ..Diagnostic::default()
+    }
+}
+
 fn parse_xml_error_pos(msg: &str) -> (u32, u32) {
     let mut iter = msg.splitn(3, ':');
     let row = iter.next().and_then(|s| s.trim().parse::<u32>().ok());
