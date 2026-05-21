@@ -11,6 +11,9 @@ pub struct Document {
     /// True when the root element declares xmlns:xacro — indicates a xacro fragment
     /// where some links/joints may be defined in included files.
     pub is_xacro: bool,
+    /// False when XML parsing failed — semantic checks (undefined refs, etc.)
+    /// must skip work, otherwise empty symbol tables flag everything as undefined.
+    pub parse_ok: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +53,7 @@ pub fn parse(text: &str) -> (Document, Vec<Diagnostic>) {
         xacro_properties: Vec::new(),
         gazebo_refs: Vec::new(),
         is_xacro: false,
+        parse_ok: true,
     };
 
     let xml = match roxmltree::Document::parse(text) {
@@ -59,6 +63,7 @@ pub fn parse(text: &str) -> (Document, Vec<Diagnostic>) {
             // mismatched/unclosed tags ourselves so the diagnostic points at
             // the actual misspelled opening tag, not the closing tag where
             // roxmltree first noticed the inconsistency.
+            doc.parse_ok = false;
             let balance_diags = scan_tag_balance(text);
             if !balance_diags.is_empty() {
                 return (doc, balance_diags);

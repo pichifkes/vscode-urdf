@@ -777,6 +777,28 @@ mod tests {
     }
 
     #[test]
+    fn xml_parse_failure_does_not_cascade_undefined_props() {
+        // Malformed XML elsewhere in the file must not turn every ${...}
+        // reference into a false "Undefined xacro property" — properties
+        // are defined at the top but parsing fails on the bad line, so
+        // doc.xacro_properties is empty. We rely on parse_ok to skip check().
+        let text = r#"<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="r">
+  <xacro:property name="wheel_radius" value="0.033"/>
+  <link name="x"><visual><geometry>
+    <cylinder radius=aa"ssdada${wheel_radius}s" length="${wheel_thickness}"/>
+  </geometry></visual></link>
+</robot>"#;
+        let (doc, mut diags) = document::parse(text);
+        if doc.parse_ok {
+            diags.extend(check(&doc, text));
+        }
+        let undef: Vec<_> = diags.iter().filter(|d| d.message.contains("Undefined xacro property")).collect();
+        assert!(undef.is_empty(),
+            "no Undefined-xacro-property diagnostics should fire when XML parse fails, got: {:?}",
+            undef.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn unclosed_xacro_expression_is_flagged() {
         let text = r#"<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="r">
   <xacro:property name="wheel_thickness" value="0.026"/>
