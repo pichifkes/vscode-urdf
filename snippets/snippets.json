@@ -111,10 +111,11 @@
 	},
 
 	"geometryFull": {
+		"_comment": "Geometry primitive choice list mirrors GEOMETRY_PRIMITIVES in server/src/diagnostics.rs (single source of truth). Update both when adding a new URDF geometry primitive.",
 		"prefix": "geometry",
 		"body": [
 			"<geometry>",
-			"\t${1|<box size=\"0.0 0.0 0.0\"/>,<cylinder radius=\"0.0\" length=\"0.0\"/>,<sphere radius=\"0.0\"/>,<mesh filename=\"\" scale=\"1.0\"/>|}",
+			"\t${1|<box size=\"0.0 0.0 0.0\"/>,<cylinder radius=\"0.0\" length=\"0.0\"/>,<sphere radius=\"0.0\"/>,<mesh filename=\"\" scale=\"1.0 1.0 1.0\"/>|}",
 			"</geometry>"
 		],
 		"description": "Insert full geometric properties"
@@ -124,7 +125,7 @@
 		"prefix": "mesh",
 		"body": [
 			"<geometry>",
-			"\t<mesh filename=\"${1:file_path}\" scale=\"${2:1.0}\"/>",
+			"\t<mesh filename=\"${1:file_path}\" scale=\"${2:1.0 1.0 1.0}\"/>",
 			"</geometry>$0"
 		],
 		"description": "Insert basic geometric properties"
@@ -170,6 +171,7 @@
 	},
 
 	"joint": {
+		"_comment": "Joint-type choice list mirrors JOINT_TYPES in server/src/diagnostics.rs (single source of truth). Update both when adding a new URDF joint type.",
 		"prefix": "joint",
 		"body": [
 			"<joint name=\"${1:joint_name}\" type=\"${2|revolute,continuous,prismatic,fixed,floating,planar|}\">",
@@ -180,6 +182,7 @@
 	},
 
 	"jointFull": {
+		"_comment": "Joint-type choice list mirrors JOINT_TYPES in server/src/diagnostics.rs (single source of truth). Update both when adding a new URDF joint type.",
 		"prefix": "joint",
 		"body": [
 			"<joint name=\"${1:joint_name}\" type=\"${2|revolute,continuous,prismatic,fixed,floating,planar|}\">",
@@ -210,6 +213,7 @@
 	},
 
 	"linkFull": {
+        "_comment": "Geometry primitive choice lists in <visual> and <collision> mirror GEOMETRY_PRIMITIVES in server/src/diagnostics.rs (single source of truth). Update both when adding a new URDF geometry primitive.",
         "prefix": "link",
         "body": [
             "<link name=\"${1:link_name}\">",
@@ -221,7 +225,7 @@
             "\t<visual name=\"\">",
             "\t\t<origin xyz=\"${5:0.0 0.0 0.0}\" rpy=\"${6:0.0 0.0 0.0}\"/>",
             "\t\t<geometry>",
-            "\t\t\t${7|<box size=\"0.0 0.0 0.0\"/>,<cylinder radius=\"0.0\" length=\"0.0\"/>,<sphere radius=\"0.0\"/>,<mesh filename=\"\" scale=\"1.0\"/>|}",
+            "\t\t\t${7|<box size=\"0.0 0.0 0.0\"/>,<cylinder radius=\"0.0\" length=\"0.0\"/>,<sphere radius=\"0.0\"/>,<mesh filename=\"\" scale=\"1.0 1.0 1.0\"/>|}",
             "\t\t</geometry>",
             "\t\t<material name=\"\">",
             "\t\t\t<color rgba=\"1.0 0.0 0.0 1.0\"/>",
@@ -231,7 +235,7 @@
             "\t<collision>",
             "\t\t<origin xyz=\"${5:0.0 0.0 0.0}\" rpy=\"${6:0.0 0.0 0.0}\"/>",
             "\t\t<geometry>",
-            "\t\t\t${7|<box size=\"0.0 0.0 0.0\"/>,<cylinder radius=\"0.0\" length=\"0.0\"/>,<sphere radius=\"0.0\"/>,<mesh filename=\"\" scale=\"1.0\"/>|}",
+            "\t\t\t${7|<box size=\"0.0 0.0 0.0\"/>,<cylinder radius=\"0.0\" length=\"0.0\"/>,<sphere radius=\"0.0\"/>,<mesh filename=\"\" scale=\"1.0 1.0 1.0\"/>|}",
             "\t\t</geometry>",
             "\t</collision>",
             "</link>"
@@ -287,7 +291,7 @@
 
 	"mesh":{
 		"prefix": "mesh",
-		"body": "<mesh filename=\"${1:file_path}\" scale=\"${2:1.0}\"/>",
+		"body": "<mesh filename=\"${1:file_path}\" scale=\"${2:1.0 1.0 1.0}\"/>",
 		"description": "Insert mesh"
 	},
 
@@ -408,10 +412,10 @@
 		"description": "Insert xyz"
 	},
 
-	"xacroInclude": {
-		"prefix": "include",
-		"body":	"<xacro:include filename=\"${1:xacroFile}\"/>",
-		"description": "Insert xacro include tag"
+	"xacroProperty": {
+		"prefix": "xacro",
+		"body":	"<xacro:property name=\"${1:name}\" value=\"${2:0.0}\"/>",
+		"description": "Insert xacro property (v1: no macros, no includes)"
 	},
 	"transmissionFull": {
 		"prefix": "transmission",

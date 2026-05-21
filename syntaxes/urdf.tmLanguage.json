@@ -107,6 +107,7 @@
             "patterns": [{ "include": "#attribute" }]
         },
         "geometry-tag": {
+            "comment": "Element-name alternation mirrors GEOMETRY_PRIMITIVES in server/src/diagnostics.rs (single source of truth). Update both when adding a new URDF geometry primitive.",
             "begin": "(</?)(box|cylinder|sphere|mesh)(?=[\\s/>])",
             "beginCaptures": {
                 "1": { "name": "punctuation.definition.tag.xml" },
@@ -118,7 +119,8 @@
             "patterns": [{ "include": "#attribute" }]
         },
         "gazebo-prop-tag": {
-            "begin": "(</?)(mu1|mu2|mu|kp|kd|maxVel|minDepth|maxContacts|selfCollide|turnGravityOff|gravity|implicitSpringDamper|dampingFactor|laserRetro|stopCfm|stopErp|fudgeFactor)(?=[\\s/>])",
+            "comment": "Element-name alternation mirrors GAZEBO_PROPS in server/src/diagnostics.rs (single source of truth). Update both when adding or renaming a Gazebo property.",
+            "begin": "(</?)(mu1|mu2|mu|kp|kd|maxVel|minDepth|maxContacts|selfCollide|turnGravityOff|gravity|implicitSpringDamper|dampingFactor|laserRetro|material|stopCfm|stopErp|fudgeFactor|sensor|plugin)(?=[\\s/>])",
             "beginCaptures": {
                 "1": { "name": "punctuation.definition.tag.xml" },
                 "2": { "name": "support.constant.gazebo" }
@@ -178,6 +180,7 @@
             ]
         },
         "joint-type-value": {
+            "comment": "Value alternation mirrors JOINT_TYPES in server/src/diagnostics.rs (single source of truth). Update both when adding a new URDF joint type.",
             "match": "\\b(revolute|continuous|prismatic|fixed|floating|planar)\\b",
             "name": "constant.language.urdf"
         },

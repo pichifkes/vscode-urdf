@@ -1,5 +1,60 @@
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
+/// How an opening tag terminated (return value of [`scan_to_tag_close`]).
+pub(crate) enum TagCloseResult {
+    /// Saw `>` — element is open. `end` is the byte offset just past `>`.
+    Open { end: usize },
+    /// Saw `/>` — element is self-closing. `end` is the byte offset just past `>`.
+    SelfClosing { end: usize },
+    /// Reached end-of-input without seeing either (e.g. the tag is still being typed).
+    Unterminated,
+}
+
+/// Walk `bytes` from `start` looking for the end of an XML opening tag,
+/// honouring quoted attribute values so a `>` or `/` inside `attr="..."`
+/// doesn't fool the scanner. Caller is responsible for positioning `start`
+/// *after* the tag name (i.e. at the start of the attribute zone).
+///
+/// **Single source of truth** for the quote-aware tag-end scan.
+///
+/// **Consumers:**
+///   - `scan_tag_balance()` in this file → push to stack on `Open`, skip on `SelfClosing`
+///   - `find_opening_tag_end()` in this file → unwrap `end`, fall back to `bytes.len()` on `Unterminated`
+///   - `inside_gazebo_block()` in `server/src/features.rs` → map `Open` → true, `SelfClosing` → false
+pub(crate) fn scan_to_tag_close(bytes: &[u8], start: usize) -> TagCloseResult {
+    let mut i = start;
+    let mut in_quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match in_quote {
+            Some(q) if b == q => in_quote = None,
+            Some(_) => {}
+            None => {
+                if b == b'"' || b == b'\'' {
+                    in_quote = Some(b);
+                } else if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
+                    return TagCloseResult::SelfClosing { end: i + 2 };
+                } else if b == b'>' {
+                    return TagCloseResult::Open { end: i + 1 };
+                }
+            }
+        }
+        i += 1;
+    }
+    TagCloseResult::Unterminated
+}
+
+/// Identifier set on every `Diagnostic.source` this server emits.
+/// Editors use this to filter / group problems by which server produced them.
+///
+/// **Consumers (read from this constant):**
+///   - `parse()` → XML parse-error diagnostic in this file
+///   - `diag_at()` → tag-balance fallback diagnostics in this file
+///   - `make_diag()` in `server/src/diagnostics.rs`
+///
+/// (see `server/src/document.rs` for source — this is it.)
+pub(crate) const DIAGNOSTIC_SOURCE: &str = "urdf-lsp";
+
 #[derive(Debug, Clone)]
 pub struct Document {
     pub links: Vec<NamedItem>,
@@ -74,7 +129,7 @@ pub fn parse(text: &str) -> (Document, Vec<Diagnostic>) {
             let diag = Diagnostic {
                 range: Range::new(pos, Position::new(line, col + 1)),
                 severity: Some(DiagnosticSeverity::ERROR),
-                source: Some("urdf-lsp".into()),
+                source: Some(DIAGNOSTIC_SOURCE.into()),
                 message: format!("XML parse error: {e}"),
                 ..Diagnostic::default()
             };
@@ -203,8 +258,6 @@ pub fn parse(text: &str) -> (Document, Vec<Diagnostic>) {
     (doc, vec![])
 }
 
-/// Parse a row:col prefix from roxmltree error messages (e.g. "9:5 unexpected close tag").
-/// Returns 0-indexed (line, character). Falls back to (0, 0) if the format doesn't match.
 /// Walk the document tracking opening/closing tag balance. Returns a single
 /// diagnostic positioned on the actual misspelled (or unclosed) opening tag,
 /// rather than at the closing tag where the inconsistency was detected.
@@ -317,29 +370,12 @@ fn scan_tag_balance(text: &str) -> Vec<Diagnostic> {
             continue;
         }
 
-        // Walk to '>' or '/>', honouring quoted attribute values.
-        let mut self_closing = false;
-        let mut in_quote: Option<u8> = None;
-        while i < bytes.len() {
-            let b = bytes[i];
-            match in_quote {
-                Some(q) if b == q => in_quote = None,
-                Some(_) => {}
-                None => {
-                    if b == b'"' || b == b'\'' {
-                        in_quote = Some(b);
-                    } else if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
-                        self_closing = true;
-                        i += 2;
-                        break;
-                    } else if b == b'>' {
-                        i += 1;
-                        break;
-                    }
-                }
-            }
-            i += 1;
-        }
+        // Walk to '>' or '/>' via the canonical scanner.
+        let self_closing = match scan_to_tag_close(bytes, i) {
+            TagCloseResult::Open { end } => { i = end; false }
+            TagCloseResult::SelfClosing { end } => { i = end; true }
+            TagCloseResult::Unterminated => { i = bytes.len(); false }
+        };
 
         if !self_closing {
             stack.push((name, name_start, name_end));
@@ -366,7 +402,7 @@ fn diag_at(text: &str, range: std::ops::Range<usize>, msg: String) -> Diagnostic
     Diagnostic {
         range: byte_range_to_lsp(text, range),
         severity: Some(DiagnosticSeverity::ERROR),
-        source: Some("urdf-lsp".into()),
+        source: Some(DIAGNOSTIC_SOURCE.into()),
         message: msg,
         ..Diagnostic::default()
     }
@@ -406,20 +442,25 @@ pub(crate) fn attr_value_range(text: &str, node: &roxmltree::Node, attr_name: &s
         }
     };
 
-    // The element's byte range in the source
+    // The element's byte range in the source.
     let elem_range = node.range();
     let elem_src = &text[elem_range.clone()];
 
-    // Look for attr_name="value" or attr_name='value' within the element source.
-    // We search for the attribute name followed by = and then the quoted value.
+    // Restrict the search to the opening-tag header so a child element that
+    // happens to share the same `name="value"` pair doesn't get its span
+    // returned instead. The header ends at the first unquoted `>` or `/>`.
+    let header_end = find_opening_tag_end(elem_src);
+    let header = &elem_src[..header_end];
+
+    // Look for attr_name="value" or attr_name='value' inside the header only.
     let needle_dq = format!("{}=\"{}\"", attr_name, value);
     let needle_sq = format!("{}='{}'", attr_name, value);
 
-    let offset = elem_src
+    let offset = header
         .find(needle_dq.as_str())
         .map(|pos| pos + attr_name.len() + 2) // skip name="
         .or_else(|| {
-            elem_src
+            header
                 .find(needle_sq.as_str())
                 .map(|pos| pos + attr_name.len() + 2) // skip name='
         });
@@ -434,21 +475,158 @@ pub(crate) fn attr_value_range(text: &str, node: &roxmltree::Node, attr_name: &s
     }
 }
 
-pub(crate) fn byte_offset_to_position(text: &str, offset: usize) -> Position {
-    let safe_offset = offset.min(text.len());
-    let before = &text[..safe_offset];
-    let line = before.bytes().filter(|&b| b == b'\n').count();
-    let last_newline = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
-    let character = before[last_newline..].chars().count();
-    Position {
-        line: line as u32,
-        character: character as u32,
+/// Return the byte offset just past the first unquoted `>` or `/>` in `elem_src`
+/// (i.e. the end of the opening-tag header). Falls back to `elem_src.len()` if
+/// neither is found. Derived from [`scan_to_tag_close`] — the canonical
+/// quote-aware tag-end scanner.
+fn find_opening_tag_end(elem_src: &str) -> usize {
+    match scan_to_tag_close(elem_src.as_bytes(), 0) {
+        TagCloseResult::Open { end } | TagCloseResult::SelfClosing { end } => end,
+        TagCloseResult::Unterminated => elem_src.len(),
     }
+}
+
+/// Round `offset` down to the nearest UTF-8 char boundary (clamped to `text.len()`).
+/// Used to guard against panics on slicing operations driven by externally-supplied
+/// offsets (e.g. positions from the LSP client).
+pub(crate) fn floor_char_boundary(text: &str, offset: usize) -> usize {
+    let mut i = offset.min(text.len());
+    while i > 0 && !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Convert a UTF-8 byte offset to an LSP `Position` (line + byte-offset within the line).
+/// Assumes UTF-8 position encoding was negotiated in `initialize`; for clients that
+/// stayed on UTF-16, the `character` value will be off for non-ASCII content but
+/// will never panic.
+pub(crate) fn byte_offset_to_position(text: &str, offset: usize) -> Position {
+    let safe = floor_char_boundary(text, offset);
+    let before = &text[..safe];
+    let line = before.bytes().filter(|&b| b == b'\n').count() as u32;
+    let last_newline = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
+    let character = (safe - last_newline) as u32;
+    Position { line, character }
+}
+
+/// Convert an LSP `Position` to a UTF-8 byte offset.
+/// Handles both `\n` and `\r\n` line endings (the `character` field never crosses a `\n`).
+/// Floors to a char boundary so the returned offset is always safe to slice on.
+pub(crate) fn position_to_byte_offset(text: &str, pos: Position) -> usize {
+    let bytes = text.as_bytes();
+    let mut idx = 0usize;
+    let mut cur_line = 0u32;
+    while cur_line < pos.line && idx < bytes.len() {
+        if bytes[idx] == b'\n' {
+            cur_line += 1;
+        }
+        idx += 1;
+    }
+    let mut col = 0u32;
+    while idx < bytes.len() && bytes[idx] != b'\n' && col < pos.character {
+        idx += 1;
+        col += 1;
+    }
+    floor_char_boundary(text, idx)
 }
 
 pub(crate) fn byte_range_to_lsp(text: &str, range: std::ops::Range<usize>) -> Range {
     Range {
         start: byte_offset_to_position(text, range.start),
         end: byte_offset_to_position(text, range.end),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_offset_to_position_clamps_past_end() {
+        let text = "ab\ncd";
+        let pos = byte_offset_to_position(text, 9999);
+        assert_eq!(pos, Position { line: 1, character: 2 });
+    }
+
+    #[test]
+    fn byte_offset_to_position_floors_to_char_boundary() {
+        // "héllo" — "é" is two bytes (0xC3 0xA9). Offset 2 lands mid-codepoint.
+        let text = "héllo";
+        // Asking for offset 2 (mid-é) must not panic and must floor to 1.
+        let pos = byte_offset_to_position(text, 2);
+        assert_eq!(pos, Position { line: 0, character: 1 });
+    }
+
+    #[test]
+    fn position_to_byte_offset_handles_crlf() {
+        let text = "a\r\nb\r\nc";
+        // line 2, char 0 → byte offset of 'c'
+        let off = position_to_byte_offset(text, Position { line: 2, character: 0 });
+        assert_eq!(&text[off..], "c");
+    }
+
+    #[test]
+    fn position_to_byte_offset_clamps_at_line_end() {
+        let text = "ab\ncd";
+        // Asking for character past EOL must clamp at \n, not cross into the next line.
+        let off = position_to_byte_offset(text, Position { line: 0, character: 99 });
+        assert_eq!(off, 2); // position of the \n
+    }
+
+    #[test]
+    fn position_to_byte_offset_floors_char_boundary_on_nonascii() {
+        // Even if a buggy client claims character=1 of "é" (which would be mid-codepoint
+        // in UTF-8), we must not panic and must return a safe byte offset.
+        let text = "é";
+        let off = position_to_byte_offset(text, Position { line: 0, character: 1 });
+        assert!(text.is_char_boundary(off));
+    }
+
+    #[test]
+    fn scan_to_tag_close_open_tag() {
+        let src = b"<gazebo reference=\"x\">rest";
+        let TagCloseResult::Open { end } = scan_to_tag_close(src, b"<gazebo".len()) else {
+            panic!("expected Open");
+        };
+        assert_eq!(&src[..end], b"<gazebo reference=\"x\">");
+    }
+
+    #[test]
+    fn scan_to_tag_close_self_closing() {
+        let src = b"<gazebo reference=\"x\"/>rest";
+        let TagCloseResult::SelfClosing { end } = scan_to_tag_close(src, b"<gazebo".len()) else {
+            panic!("expected SelfClosing");
+        };
+        assert_eq!(&src[..end], b"<gazebo reference=\"x\"/>");
+    }
+
+    #[test]
+    fn scan_to_tag_close_quoted_gt_inside_attr_does_not_terminate() {
+        // `>` inside a quoted attribute value must not be treated as the tag end.
+        let src = b"<gazebo reference=\"a>b\">rest";
+        let TagCloseResult::Open { end } = scan_to_tag_close(src, b"<gazebo".len()) else {
+            panic!("expected Open");
+        };
+        assert_eq!(&src[..end], b"<gazebo reference=\"a>b\">");
+    }
+
+    #[test]
+    fn scan_to_tag_close_quoted_slash_gt_does_not_self_close() {
+        // `/>` inside a quoted attribute value must not be treated as self-closing.
+        let src = b"<gazebo reference=\"a/>b\">rest";
+        let TagCloseResult::Open { end } = scan_to_tag_close(src, b"<gazebo".len()) else {
+            panic!("expected Open");
+        };
+        assert_eq!(&src[..end], b"<gazebo reference=\"a/>b\">");
+    }
+
+    #[test]
+    fn scan_to_tag_close_unterminated_when_no_close() {
+        let src = b"<gazebo reference=\"x\"  ";
+        assert!(matches!(
+            scan_to_tag_close(src, b"<gazebo".len()),
+            TagCloseResult::Unterminated,
+        ));
     }
 }

@@ -19,7 +19,7 @@
     ],
     "repository": {
         "type": "git",
-        "url": "https://github.com/OTL/vscode-urdf.git"
+        "url": "https://github.com/pichifkes/vscode-urdf.git"
     },
     "contributes": {
         "languages": [

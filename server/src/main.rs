@@ -18,9 +18,20 @@ struct Backend {
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        // Prefer UTF-8 position encoding so `Position.character` is a byte offset
+        // matching our internal UTF-8 text storage. Fall back to UTF-16 (the LSP
+        // default) if the client doesn't advertise UTF-8 support.
+        let position_encoding = params
+            .capabilities
+            .general
+            .as_ref()
+            .and_then(|g| g.position_encodings.as_ref())
+            .and_then(|encs| encs.iter().find(|e| **e == PositionEncodingKind::UTF8).cloned());
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
+                position_encoding,
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),

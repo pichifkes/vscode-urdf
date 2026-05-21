@@ -2,15 +2,143 @@ use std::borrow::Cow;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Range};
 use crate::document::Document;
 
-/// Canonical list of Gazebo property element names.
-/// Shared with the completion provider — keep in sync with `known_gazebo_prop`.
-pub const GAZEBO_PROP_NAMES: &[&str] = &[
-    "mu1", "mu2", "mu", "kp", "kd",
-    "maxVel", "minDepth", "maxContacts",
-    "selfCollide", "turnGravityOff", "gravity", "implicitSpringDamper",
-    "dampingFactor", "laserRetro", "material",
-    "stopCfm", "stopErp", "fudgeFactor",
-    "sensor", "plugin",
+/// Type-kind tag for a Gazebo property element, used by `validate_gazebo_text`.
+#[derive(Copy, Clone)]
+pub enum GazeboPropKind {
+    Float,
+    NonNegFloat,
+    PositiveFloat,
+    Bool,
+    Int,
+    AnyString,
+    Lenient,
+}
+
+/// Canonical Gazebo property schema — **single source of truth**.
+///
+/// Each entry is `(element_name, value_type)`. Everything else in the codebase
+/// that talks about Gazebo property elements derives from this table:
+///
+/// **Consumers (read from this table):**
+///   - `known_gazebo_prop()` in this file → name → `GazeboPropKind` lookup
+///   - `features::completion()` in `server/src/features.rs` → completion labels
+///     inside a `<gazebo>` block
+///
+/// **Consumer that cannot share data structurally (manual sync required):**
+///   - `gazebo-prop-tag` regex alternation in `syntaxes/urdf.tmLanguage.json`
+///     — JSON file, must be kept in sync by hand. There is no test asserting
+///     equivalence (yet); if you add or rename a property here, update the
+///     grammar regex too.
+pub const GAZEBO_PROPS: &[(&str, GazeboPropKind)] = &[
+    ("mu1",                  GazeboPropKind::NonNegFloat),
+    ("mu2",                  GazeboPropKind::NonNegFloat),
+    ("mu",                   GazeboPropKind::NonNegFloat),
+    ("kp",                   GazeboPropKind::PositiveFloat),
+    ("kd",                   GazeboPropKind::PositiveFloat),
+    ("maxVel",               GazeboPropKind::NonNegFloat),
+    ("minDepth",             GazeboPropKind::NonNegFloat),
+    ("maxContacts",          GazeboPropKind::Int),
+    ("selfCollide",          GazeboPropKind::Bool),
+    ("turnGravityOff",       GazeboPropKind::Bool),
+    ("gravity",              GazeboPropKind::Bool),
+    ("implicitSpringDamper", GazeboPropKind::Bool),
+    ("dampingFactor",        GazeboPropKind::Float),
+    ("laserRetro",           GazeboPropKind::Float),
+    ("material",             GazeboPropKind::AnyString),
+    ("stopCfm",              GazeboPropKind::NonNegFloat),
+    ("stopErp",              GazeboPropKind::NonNegFloat),
+    ("fudgeFactor",          GazeboPropKind::Float),
+    ("sensor",               GazeboPropKind::Lenient),
+    ("plugin",               GazeboPropKind::Lenient),
+];
+
+/// One URDF element together with its attribute schema. Shared by both
+/// [`GEOMETRY_PRIMITIVES`] and [`URDF_ELEMENTS`]; do not construct these elsewhere.
+pub struct UrdfElement {
+    pub name: &'static str,
+    /// Attributes that **must** be present (drives "missing required attribute" diagnostics).
+    pub required_attrs: &'static [&'static str],
+    /// All attributes that are recognised on this element (drives "unknown attribute" diagnostics).
+    /// Must be a superset of `required_attrs`.
+    pub known_attrs: &'static [&'static str],
+}
+
+/// Canonical URDF geometry primitive schema — **single source of truth**.
+///
+/// **Consumers (read from this table):**
+///   - `required_urdf_attrs()` in this file → looks up `required_attrs` per primitive
+///   - `known_urdf_attrs()` in this file → looks up `known_attrs` per primitive
+///
+/// **Consumers that cannot share data structurally (manual sync required):**
+///   - `geometry-tag` regex in `syntaxes/urdf.tmLanguage.json`
+///   - `geometryFull` and `linkFull` snippet choice arrays in `snippets/snippets.json`
+///
+/// (see `server/src/diagnostics.rs` for source — this is it.)
+///
+/// Kept as a separate table from [`URDF_ELEMENTS`] because the grammar maps
+/// geometry primitives to their own scope (`geometry-tag` → `support.type.urdf`)
+/// — keeping the categories visibly distinct here mirrors that.
+pub const GEOMETRY_PRIMITIVES: &[UrdfElement] = &[
+    UrdfElement { name: "box",      required_attrs: &["size"],             known_attrs: &["size"] },
+    UrdfElement { name: "cylinder", required_attrs: &["radius", "length"], known_attrs: &["radius", "length"] },
+    UrdfElement { name: "sphere",   required_attrs: &["radius"],           known_attrs: &["radius"] },
+    UrdfElement { name: "mesh",     required_attrs: &["filename"],         known_attrs: &["filename", "scale"] },
+];
+
+/// Canonical URDF element schema (everything except the geometry primitives,
+/// which live in [`GEOMETRY_PRIMITIVES`]) — **single source of truth**.
+///
+/// **Consumers (read from this table):**
+///   - `required_urdf_attrs()` in this file → looks up `required_attrs` per element
+///   - `known_urdf_attrs()` in this file → looks up `known_attrs` per element;
+///     a `None` lookup is what triggers the "Unknown URDF element" diagnostic
+///
+/// **Consumers that cannot share data structurally (manual sync required):**
+///   - Element-name alternations in `syntaxes/urdf.tmLanguage.json` (`container-tag`,
+///     `structure-tag`, `material-tag`, `inertial-tag`, etc.) — each grammar rule
+///     covers a category subset, not the whole list, so there's no 1:1 mapping
+///   - Snippet bodies in `snippets/snippets.json` that hard-code element names
+///
+/// (see `server/src/diagnostics.rs` for source — this is it.)
+pub const URDF_ELEMENTS: &[UrdfElement] = &[
+    UrdfElement { name: "robot",             required_attrs: &[],            known_attrs: &["name"] }, // name optional in xacro fragments
+    UrdfElement { name: "link",              required_attrs: &["name"],      known_attrs: &["name"] },
+    UrdfElement { name: "joint",             required_attrs: &["name", "type"], known_attrs: &["name", "type"] },
+    UrdfElement { name: "visual",            required_attrs: &[],            known_attrs: &["name"] },
+    UrdfElement { name: "collision",         required_attrs: &[],            known_attrs: &["name"] },
+    UrdfElement { name: "inertial",          required_attrs: &[],            known_attrs: &[] },
+    UrdfElement { name: "origin",            required_attrs: &[],            known_attrs: &["xyz", "rpy"] },
+    UrdfElement { name: "geometry",          required_attrs: &[],            known_attrs: &[] },
+    UrdfElement { name: "material",          required_attrs: &[],            known_attrs: &["name"] },
+    UrdfElement { name: "color",             required_attrs: &["rgba"],      known_attrs: &["rgba"] },
+    UrdfElement { name: "texture",           required_attrs: &[],            known_attrs: &["filename"] },
+    UrdfElement { name: "mass",              required_attrs: &["value"],     known_attrs: &["value"] },
+    UrdfElement { name: "inertia",           required_attrs: &[],            known_attrs: &["ixx", "ixy", "ixz", "iyy", "iyz", "izz"] },
+    UrdfElement { name: "parent",            required_attrs: &["link"],      known_attrs: &["link"] },
+    UrdfElement { name: "child",             required_attrs: &["link"],      known_attrs: &["link"] },
+    UrdfElement { name: "axis",              required_attrs: &[],            known_attrs: &["xyz"] },
+    UrdfElement { name: "limit",             required_attrs: &[],            known_attrs: &["lower", "upper", "effort", "velocity"] },
+    UrdfElement { name: "dynamics",          required_attrs: &[],            known_attrs: &["damping", "friction"] },
+    UrdfElement { name: "safety_controller", required_attrs: &[],            known_attrs: &["soft_lower_limit", "soft_upper_limit", "k_position", "k_velocity"] },
+    UrdfElement { name: "calibration",       required_attrs: &[],            known_attrs: &["rising", "falling"] },
+    UrdfElement { name: "mimic",             required_attrs: &["joint"],     known_attrs: &["joint", "multiplier", "offset"] },
+    UrdfElement { name: "transmission",      required_attrs: &[],            known_attrs: &["name"] },
+    UrdfElement { name: "gazebo",            required_attrs: &[],            known_attrs: &["reference"] },
+];
+
+/// Canonical URDF joint type values — **single source of truth**.
+///
+/// **Consumers (read from this table):**
+///   - `validate_attr_value()` in this file → arm for `("joint", "type")`
+///     emits an error if `type=` is not one of these strings.
+///
+/// **Consumers that cannot share data structurally (manual sync required):**
+///   - `joint-type-value` regex in `syntaxes/urdf.tmLanguage.json`
+///   - `joint` and `jointFull` snippet choice arrays in `snippets/snippets.json`
+///
+/// (see `server/src/diagnostics.rs` for source — this is it.)
+pub const JOINT_TYPES: &[&str] = &[
+    "revolute", "continuous", "prismatic", "fixed", "floating", "planar",
 ];
 
 pub fn check(doc: &Document, text: &str) -> Vec<Diagnostic> {
@@ -204,11 +332,11 @@ fn kinematic_tree_check(
         .map(|l| l.name.as_str())
         .collect();
 
-    // Multiple roots.
+    // Multiple roots — flag every root so the user can pick which one to delete/fix
+    // rather than chasing a document-order-dependent diagnostic.
     if roots.len() > 1 {
         for link in doc.links.iter()
             .filter(|l| !child_set.contains(l.name.as_str()) && adj.contains_key(l.name.as_str()))
-            .skip(1)
         {
             diags.push(make_diag(
                 link.range,
@@ -397,30 +525,10 @@ fn walk_schema(
     }
 }
 
-#[derive(Copy, Clone)]
-enum GazeboPropKind {
-    Float,
-    NonNegFloat,
-    PositiveFloat,
-    Bool,
-    Int,
-    AnyString,
-    Lenient,
-}
-
+/// Look up the value-type kind for a Gazebo property element name.
+/// Derived from [`GAZEBO_PROPS`] — that table is the single source of truth.
 fn known_gazebo_prop(tag: &str) -> Option<GazeboPropKind> {
-    match tag {
-        "mu1" | "mu2" | "mu"                          => Some(GazeboPropKind::NonNegFloat),
-        "kp" | "kd"                                   => Some(GazeboPropKind::PositiveFloat),
-        "maxVel" | "minDepth" | "stopCfm" | "stopErp" => Some(GazeboPropKind::NonNegFloat),
-        "dampingFactor" | "laserRetro" | "fudgeFactor" => Some(GazeboPropKind::Float),
-        "maxContacts"                                  => Some(GazeboPropKind::Int),
-        "selfCollide" | "turnGravityOff" | "gravity"
-        | "implicitSpringDamper"                       => Some(GazeboPropKind::Bool),
-        "material"                                     => Some(GazeboPropKind::AnyString),
-        "sensor" | "plugin"                            => Some(GazeboPropKind::Lenient),
-        _                                              => None,
-    }
+    GAZEBO_PROPS.iter().find(|(name, _)| *name == tag).map(|(_, kind)| *kind)
 }
 
 fn walk_gazebo_child(
@@ -488,22 +596,17 @@ fn validate_gazebo_text(
     }
 }
 
+/// Look up the required attributes for a URDF element. Derived from
+/// [`GEOMETRY_PRIMITIVES`] and [`URDF_ELEMENTS`] — those tables are the
+/// single source of truth. Unknown elements return `&[]`.
 fn required_urdf_attrs(element: &str) -> &'static [&'static str] {
-    match element {
-        "robot"    => &[],   // name is optional in xacro fragments
-        "link"     => &["name"],
-        "joint"    => &["name", "type"],
-        "parent"   => &["link"],
-        "child"    => &["link"],
-        "box"      => &["size"],
-        "cylinder" => &["radius", "length"],
-        "sphere"   => &["radius"],
-        "mesh"     => &["filename"],
-        "color"    => &["rgba"],
-        "mass"     => &["value"],
-        "mimic"    => &["joint"],
-        _          => &[],
+    if let Some(e) = GEOMETRY_PRIMITIVES.iter().find(|e| e.name == element) {
+        return e.required_attrs;
     }
+    URDF_ELEMENTS.iter()
+        .find(|e| e.name == element)
+        .map(|e| e.required_attrs)
+        .unwrap_or(&[])
 }
 
 fn validate_attr_value(
@@ -514,6 +617,18 @@ fn validate_attr_value(
 ) -> Option<String> {
     let effective = resolve_effective(value, props)?;
     match (element, attr) {
+        // Joint type must be one of the canonical values — see JOINT_TYPES above for source.
+        ("joint", "type") => {
+            let t = effective.trim();
+            if JOINT_TYPES.iter().any(|v| *v == t) {
+                None
+            } else {
+                Some(format!(
+                    "'type' must be one of {}, got '{t}'",
+                    JOINT_TYPES.join(", "),
+                ))
+            }
+        }
         (_, "xyz") | (_, "rpy") => expect_n_floats(&effective, 3, attr),
         ("box", "size") => expect_n_floats(&effective, 3, attr)
             .or_else(|| {
@@ -624,37 +739,17 @@ fn expect_bool(value: &str, attr: &str) -> Option<String> {
     }
 }
 
+/// Look up the recognised attributes for a URDF element. Derived from
+/// [`GEOMETRY_PRIMITIVES`] and [`URDF_ELEMENTS`] — those tables are the
+/// single source of truth. `None` indicates the element itself isn't a
+/// known URDF element (which triggers the "Unknown URDF element" diagnostic).
 fn known_urdf_attrs(element: &str) -> Option<&'static [&'static str]> {
-    match element {
-        "robot"             => Some(&["name"]),
-        "link"              => Some(&["name"]),
-        "joint"             => Some(&["name", "type"]),
-        "visual"            => Some(&["name"]),
-        "collision"         => Some(&["name"]),
-        "inertial"          => Some(&[]),
-        "origin"            => Some(&["xyz", "rpy"]),
-        "geometry"          => Some(&[]),
-        "box"               => Some(&["size"]),
-        "cylinder"          => Some(&["radius", "length"]),
-        "sphere"            => Some(&["radius"]),
-        "mesh"              => Some(&["filename", "scale"]),
-        "material"          => Some(&["name"]),
-        "color"             => Some(&["rgba"]),
-        "texture"           => Some(&["filename"]),
-        "mass"              => Some(&["value"]),
-        "inertia"           => Some(&["ixx", "ixy", "ixz", "iyy", "iyz", "izz"]),
-        "parent"            => Some(&["link"]),
-        "child"             => Some(&["link"]),
-        "axis"              => Some(&["xyz"]),
-        "limit"             => Some(&["lower", "upper", "effort", "velocity"]),
-        "dynamics"          => Some(&["damping", "friction"]),
-        "safety_controller" => Some(&["soft_lower_limit", "soft_upper_limit", "k_position", "k_velocity"]),
-        "calibration"       => Some(&["rising", "falling"]),
-        "mimic"             => Some(&["joint", "multiplier", "offset"]),
-        "transmission"      => Some(&["name"]),
-        "gazebo"            => Some(&["reference"]),
-        _                   => None,
+    if let Some(e) = GEOMETRY_PRIMITIVES.iter().find(|e| e.name == element) {
+        return Some(e.known_attrs);
     }
+    URDF_ELEMENTS.iter()
+        .find(|e| e.name == element)
+        .map(|e| e.known_attrs)
 }
 
 fn elem_name_range(text: &str, node: &roxmltree::Node) -> Range {
@@ -689,7 +784,7 @@ fn make_diag(range: Range, severity: DiagnosticSeverity, message: String) -> Dia
     Diagnostic {
         range,
         severity: Some(severity),
-        source: Some("urdf-lsp".to_string()),
+        source: Some(crate::document::DIAGNOSTIC_SOURCE.to_string()),
         message,
         ..Diagnostic::default()
     }
@@ -897,6 +992,125 @@ mod tests {
         }).collect();
         assert!(labels.iter().any(|l| l.contains("0.1675")), "expected 0.1675, got: {:?}", labels);
         assert!(labels.iter().any(|l| l.contains("0.1325")), "expected 0.1325, got: {:?}", labels);
+    }
+
+    #[test]
+    fn urdf_element_unknown_attribute_is_flagged() {
+        // `<link foo="bar">` — foo is not in URDF_ELEMENTS' entry for `link`.
+        let text = r#"<?xml version="1.0"?><robot name="r">
+          <link name="a" foo="bar"/>
+        </robot>"#;
+        let xml = roxmltree::Document::parse(text).unwrap();
+        let diags = check_schema(&xml, text);
+        assert!(
+            diags.iter().any(|d| d.message.contains("Unknown attribute 'foo'") && d.message.contains("<link>")),
+            "expected unknown-attribute diagnostic on <link>, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn urdf_element_unknown_element_is_flagged() {
+        // `<weeble>` isn't in URDF_ELEMENTS or GEOMETRY_PRIMITIVES → known_urdf_attrs
+        // returns None → "Unknown URDF element" diagnostic.
+        let text = r#"<?xml version="1.0"?><robot name="r">
+          <weeble/>
+        </robot>"#;
+        let xml = roxmltree::Document::parse(text).unwrap();
+        let diags = check_schema(&xml, text);
+        assert!(
+            diags.iter().any(|d| d.message.contains("Unknown URDF element") && d.message.contains("<weeble>")),
+            "expected unknown-element diagnostic on <weeble>, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn urdf_element_missing_required_attr_via_table() {
+        // `<mimic>` without `joint` — required_attrs comes from URDF_ELEMENTS entry.
+        let text = r#"<?xml version="1.0"?><robot name="r">
+          <joint name="j" type="revolute">
+            <parent link="a"/><child link="b"/>
+            <mimic/>
+          </joint>
+        </robot>"#;
+        let xml = roxmltree::Document::parse(text).unwrap();
+        let diags = check_schema(&xml, text);
+        assert!(
+            diags.iter().any(|d| d.message.contains("<mimic>") && d.message.contains("'joint'")),
+            "expected missing-required-attr diagnostic on <mimic>, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn geometry_primitive_missing_required_attr() {
+        // <box> without size is invalid — confirms GEOMETRY_PRIMITIVES.required_attrs
+        // is wired through required_urdf_attrs().
+        let text = r#"<?xml version="1.0"?><robot name="r">
+          <link name="a"><visual><geometry><box/></geometry></visual></link>
+        </robot>"#;
+        let xml = roxmltree::Document::parse(text).unwrap();
+        let diags = check_schema(&xml, text);
+        assert!(
+            diags.iter().any(|d| d.message.contains("<box>") && d.message.contains("'size'")),
+            "expected missing-size diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn geometry_primitive_unknown_attr() {
+        // <sphere> with `length` is invalid — confirms GEOMETRY_PRIMITIVES.known_attrs
+        // is wired through known_urdf_attrs().
+        let text = r#"<?xml version="1.0"?><robot name="r">
+          <link name="a"><visual><geometry><sphere radius="0.1" length="0.2"/></geometry></visual></link>
+        </robot>"#;
+        let xml = roxmltree::Document::parse(text).unwrap();
+        let diags = check_schema(&xml, text);
+        assert!(
+            diags.iter().any(|d| d.message.contains("Unknown attribute 'length'") && d.message.contains("<sphere>")),
+            "expected unknown-attribute diagnostic on sphere, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn joint_type_typo_is_flagged() {
+        // `rotational` is not a URDF joint type — must be flagged against JOINT_TYPES.
+        let text = r#"<?xml version="1.0"?><robot name="r">
+          <link name="a"/>
+          <link name="b"/>
+          <joint name="j" type="rotational">
+            <parent link="a"/><child link="b"/>
+          </joint>
+        </robot>"#;
+        let (_, mut diags) = document::parse(text);
+        let xml = roxmltree::Document::parse(text).unwrap();
+        diags.extend(check_schema(&xml, text));
+        assert!(
+            diags.iter().any(|d| d.message.contains("'type' must be one of") && d.message.contains("rotational")),
+            "expected joint-type validator to flag 'rotational', got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn joint_type_valid_value_passes() {
+        let text = r#"<?xml version="1.0"?><robot name="r">
+          <link name="a"/>
+          <link name="b"/>
+          <joint name="j" type="revolute">
+            <parent link="a"/><child link="b"/>
+          </joint>
+        </robot>"#;
+        let xml = roxmltree::Document::parse(text).unwrap();
+        let diags = check_schema(&xml, text);
+        assert!(
+            !diags.iter().any(|d| d.message.contains("'type' must be one of")),
+            "valid joint type should not be flagged, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
     }
 
     #[test]

@@ -386,16 +386,12 @@ pub fn rename(doc: &Document, pos: Position, new_name: &str) -> Vec<(Range, Stri
 // ---------------------------------------------------------------------------
 
 pub fn completion(doc: &Document, pos: Position, text: &str) -> Vec<CompletionItem> {
-    let line_text: &str = text
-        .lines()
-        .nth(pos.line as usize)
-        .unwrap_or("");
-    let col = pos.character as usize;
-    let prefix = if col <= line_text.len() {
-        &line_text[..col]
-    } else {
-        line_text
-    };
+    // Compute the cursor's byte offset directly (handles CRLF and non-ASCII safely)
+    // and derive the line prefix from that — slicing on `pos.character` as a byte
+    // index would panic mid-codepoint.
+    let cursor_offset = crate::document::position_to_byte_offset(text, pos);
+    let line_start = text[..cursor_offset].rfind('\n').map(|p| p + 1).unwrap_or(0);
+    let prefix = &text[line_start..cursor_offset];
 
     let link_re      = regex_match(prefix, r#"link\s*=\s*"[^"]*$"#);
     let joint_re     = regex_match(prefix, r#"joint\s*=\s*"[^"]*$"#);
@@ -446,17 +442,14 @@ pub fn completion(doc: &Document, pos: Position, text: &str) -> Vec<CompletionIt
             })
             .collect()
     } else {
-        // <partial inside a <gazebo> block → offer Gazebo property element names
-        let cursor_offset: usize = text
-            .lines()
-            .take(pos.line as usize)
-            .map(|l| l.len() + 1)
-            .sum::<usize>()
-            + col.min(line_text.len());
+        // <partial inside a <gazebo> block → offer Gazebo property element names.
+        // The list of valid Gazebo properties is canonical in
+        // `diagnostics::GAZEBO_PROPS` — read names from there so completion stays
+        // in lockstep with validation.
         if inside_gazebo_block(text, cursor_offset) && is_element_name_trigger(prefix) {
-            crate::diagnostics::GAZEBO_PROP_NAMES
+            crate::diagnostics::GAZEBO_PROPS
                 .iter()
-                .map(|name| CompletionItem {
+                .map(|(name, _kind)| CompletionItem {
                     label: name.to_string(),
                     kind: Some(CompletionItemKind::PROPERTY),
                     ..CompletionItem::default()
@@ -487,44 +480,62 @@ fn regex_match(prefix: &str, pattern: &str) -> bool {
     }
 }
 
-/// Return true if `prefix` contains  `<attr>\s*=\s*"` with no subsequent `"`
-/// (i.e. we are inside the opening quote of an attribute named `attr`).
+/// Return true if `prefix` ends inside the open quote of an attribute named `attr`
+/// (i.e. it contains `<attr>\s*=\s*"` with no subsequent `"`). The `attr` match
+/// must be on a word boundary so e.g. searching for `link` does not match
+/// `xlink` or `parent_link`.
 fn find_attr_open(prefix: &str, attr: &str) -> bool {
-    // Walk backwards through all occurrences of the attribute name.
+    let bytes = prefix.as_bytes();
     let mut search = prefix;
+    let mut base = 0usize;
     loop {
         let Some(pos) = search.find(attr) else {
             return false;
         };
-        let after_attr = &search[pos + attr.len()..];
-        // Skip optional whitespace
-        let after_ws = after_attr.trim_start_matches(|c: char| c == ' ' || c == '\t');
-        if let Some(rest) = after_ws.strip_prefix('=') {
-            let after_eq = rest.trim_start_matches(|c: char| c == ' ' || c == '\t');
-            if let Some(after_quote) = after_eq.strip_prefix('"') {
-                // We are inside the quote only if there is no closing `"` after it.
-                if !after_quote.contains('"') {
-                    return true;
+        let abs = base + pos;
+        let boundary_ok = abs == 0
+            || matches!(bytes[abs - 1], b' ' | b'\t' | b'\n' | b'\r' | b'<' | b'/');
+        if boundary_ok {
+            let after_attr = &search[pos + attr.len()..];
+            let after_ws = after_attr.trim_start_matches(|c: char| c == ' ' || c == '\t');
+            if let Some(rest) = after_ws.strip_prefix('=') {
+                let after_eq = rest.trim_start_matches(|c: char| c == ' ' || c == '\t');
+                if let Some(after_quote) = after_eq.strip_prefix('"') {
+                    if !after_quote.contains('"') {
+                        return true;
+                    }
                 }
             }
         }
-        // Advance past this occurrence and keep looking.
-        search = &search[pos + attr.len()..];
-        if search.is_empty() {
+        let advance = pos + attr.len();
+        if advance >= search.len() {
             return false;
         }
+        base += advance;
+        search = &search[advance..];
     }
 }
 
 /// True when the cursor byte offset falls inside an open `<gazebo …>` block.
+/// A self-closing `<gazebo …/>` is never "inside".
 fn inside_gazebo_block(text: &str, offset: usize) -> bool {
     let before = &text[..offset.min(text.len())];
-    let last_open  = before.rfind("<gazebo");
-    let last_close = before.rfind("</gazebo");
-    match (last_open, last_close) {
-        (Some(open), Some(close)) => open > close,
-        (Some(_), None)           => true,
-        _                         => false,
+    let Some(last_open) = before.rfind("<gazebo") else {
+        return false;
+    };
+    if let Some(close) = before.rfind("</gazebo") {
+        if close > last_open {
+            return false;
+        }
+    }
+    // Walk from `<gazebo` up to the cursor via the canonical quote-aware scanner.
+    // `>` (open block) → inside; `/>` (self-closing) → not inside; unterminated
+    // (still being typed) → inside.
+    use crate::document::{scan_to_tag_close, TagCloseResult};
+    match scan_to_tag_close(before.as_bytes(), last_open + b"<gazebo".len()) {
+        TagCloseResult::Open { .. } => true,
+        TagCloseResult::SelfClosing { .. } => false,
+        TagCloseResult::Unterminated => true,
     }
 }
 
@@ -796,10 +807,11 @@ fn insert_attribute_action(uri: &Url, diag: &Diagnostic, text: &str, attr: &str)
         character: diag.range.end.character,
     };
     // Sanity check: the character at the diag end should be inside an opening tag
-    // (next non-whitespace before some attribute or `>`/`/>`).
-    let line = text.lines().nth(diag.range.end.line as usize)?;
-    let after = line.get(diag.range.end.character as usize..)?;
-    if !after.starts_with(|c: char| c == ' ' || c == '\t' || c == '>' || c == '/' || c == '\n') {
+    // (next non-whitespace before some attribute or `>`/`/>`). Use byte-offset
+    // conversion so non-ASCII content and CRLF line endings don't slice mid-codepoint.
+    let cursor = crate::document::position_to_byte_offset(text, diag.range.end);
+    let after = text.get(cursor..)?;
+    if !after.starts_with(|c: char| c == ' ' || c == '\t' || c == '>' || c == '/' || c == '\n' || c == '\r') {
         return None;
     }
     let edit = TextEdit {
@@ -824,4 +836,50 @@ fn position_in_range(pos: Position, range: Range) -> bool {
     let before_end = pos.line < range.end.line
         || (pos.line == range.end.line && pos.character <= range.end.character);
     after_start && before_end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_attr_open, inside_gazebo_block};
+
+    #[test]
+    fn find_attr_open_matches_real_attribute() {
+        assert!(find_attr_open("    <parent link=\"", "link"));
+        assert!(find_attr_open("<child link=\"foo", "link"));
+        assert!(find_attr_open("<gazebo reference=\"", "reference"));
+    }
+
+    #[test]
+    fn find_attr_open_rejects_substring_of_other_attribute() {
+        // `xlink` and `parent_link` both contain "link" but are NOT the `link` attr.
+        assert!(!find_attr_open("<joint xlink=\"foo", "link"));
+        assert!(!find_attr_open("<parent parent_link=\"foo", "link"));
+        // Closed quote → not inside.
+        assert!(!find_attr_open("<parent link=\"foo\" ", "link"));
+    }
+
+    #[test]
+    fn inside_gazebo_block_open_block() {
+        let text = "<robot>\n<gazebo reference=\"x\">\n  <";
+        assert!(inside_gazebo_block(text, text.len()));
+    }
+
+    #[test]
+    fn inside_gazebo_block_after_self_closing() {
+        let text = "<robot>\n<gazebo reference=\"x\"/>\n<";
+        assert!(!inside_gazebo_block(text, text.len()));
+    }
+
+    #[test]
+    fn inside_gazebo_block_after_explicit_close() {
+        let text = "<robot>\n<gazebo>\n  <mu1>0.5</mu1>\n</gazebo>\n<";
+        assert!(!inside_gazebo_block(text, text.len()));
+    }
+
+    #[test]
+    fn inside_gazebo_block_quoted_slash_gt_does_not_self_close() {
+        // The `/>` inside the quoted attribute value must not be treated as a tag end.
+        let text = "<gazebo reference=\"a/>b\">\n  <";
+        assert!(inside_gazebo_block(text, text.len()));
+    }
 }
