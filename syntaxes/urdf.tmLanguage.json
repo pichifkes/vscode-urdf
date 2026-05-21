@@ -37,7 +37,7 @@
         },
         "urdf-structure": {
             "match": "(?<=</?)(parent|child|mimic)(?=[\\s/>])",
-            "name": "entity.name.tag.structure.urdf"
+            "name": "variable.parameter.urdf"
         },
         "urdf-subelements": {
             "match": "(?<=</?)(visual|collision|inertial|geometry|origin|axis|limit|dynamics|safety_controller|calibration)(?=[\\s/>])",
@@ -45,11 +45,11 @@
         },
         "urdf-material": {
             "match": "(?<=</?)(material|color|texture)(?=[\\s/>])",
-            "name": "entity.name.tag.material.urdf"
+            "name": "support.class.material.urdf"
         },
         "urdf-inertial": {
             "match": "(?<=</?)(mass|inertia)(?=[\\s/>])",
-            "name": "entity.name.tag.inertial.urdf"
+            "name": "support.function.inertial.urdf"
         },
         "geometry-primitives": {
             "match": "(?<=</?)(box|cylinder|sphere|mesh)(?=[\\s/>])",
