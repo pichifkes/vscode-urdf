@@ -1,0 +1,46 @@
+{
+    "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+    "name": "URDF",
+    "scopeName": "text.xml.urdf",
+    "fileTypes": ["urdf", "xacro"],
+    "patterns": [
+        { "include": "#xacro-interpolation" },
+        { "include": "#xacro-elements" },
+        { "include": "#urdf-containers" },
+        { "include": "#urdf-subelements" },
+        { "include": "#geometry-primitives" },
+        { "include": "#joint-types" },
+        { "include": "text.xml" }
+    ],
+    "repository": {
+        "xacro-interpolation": {
+            "name": "meta.interpolation.xacro",
+            "match": "(\\$\\{)([^}]*)(\\})",
+            "captures": {
+                "1": { "name": "punctuation.definition.template-expression.begin" },
+                "2": { "name": "variable.other.xacro" },
+                "3": { "name": "punctuation.definition.template-expression.end" }
+            }
+        },
+        "xacro-elements": {
+            "match": "(?<=</?)(xacro:[a-zA-Z_][a-zA-Z0-9_]*)(?=[\\s/>])",
+            "name": "entity.name.function.xacro"
+        },
+        "urdf-containers": {
+            "match": "(?<=</?)(robot|link|joint|transmission|gazebo)(?=[\\s/>])",
+            "name": "keyword.control.urdf"
+        },
+        "urdf-subelements": {
+            "match": "(?<=</?)(visual|collision|inertial|geometry|origin|axis|limit|dynamics|safety_controller|calibration)(?=[\\s/>])",
+            "name": "storage.type.urdf"
+        },
+        "geometry-primitives": {
+            "match": "(?<=</?)(box|cylinder|sphere|mesh)(?=[\\s/>])",
+            "name": "support.type.urdf"
+        },
+        "joint-types": {
+            "match": "(?<=[\"'])(revolute|continuous|prismatic|fixed|floating|planar)(?=[\"'])",
+            "name": "constant.language.urdf"
+        }
+    }
+}

@@ -1,18 +1,21 @@
 {
     "name": "urdf",
     "displayName": "URDF",
-    "description": "Support of URDF/xacro in VSCode",
-    "version": "0.3.0",
+    "description": "URDF/xacro language support with semantic diagnostics (Linux only)",
+    "version": "0.4.0-dev",
     "publisher": "smilerobotics",
     "engines": {
-        "vscode": "^1.18.0"
+        "vscode": "^1.82.0"
     },
     "icon": "img/ros.png",
-    "extensionDependencies": [
-        "xml"
-    ],
     "categories": [
-        "Snippets"
+        "Programming Languages",
+        "Snippets",
+        "Linters"
+    ],
+    "main": "./client/out/extension.js",
+    "activationEvents": [
+        "onLanguage:urdf"
     ],
     "repository": {
         "type": "git",
@@ -21,25 +24,37 @@
     "contributes": {
         "languages": [
             {
-                "id": "xml",
+                "id": "urdf",
                 "aliases": [
+                    "URDF",
                     "urdf",
-                    "URDF"
+                    "xacro"
                 ],
                 "extensions": [
                     ".urdf",
                     ".xacro"
-                ]
+                ],
+                "configuration": "./language-configuration.json"
+            }
+        ],
+        "grammars": [
+            {
+                "language": "urdf",
+                "scopeName": "text.xml.urdf",
+                "path": "./syntaxes/urdf.tmLanguage.json"
             }
         ],
         "snippets": [
             {
-                "language": "xml",
+                "language": "urdf",
                 "path": "./snippets/snippets.json"
             }
         ]
     },
-    "devDependencies": {
-        "vscode": "^1.1.6"
+    "scripts": {
+        "install:client": "npm --prefix client install",
+        "build:client": "npm --prefix client run compile",
+        "build:server": "cargo build --manifest-path server/Cargo.toml",
+        "build": "npm run build:server && npm run build:client"
     }
 }
