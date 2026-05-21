@@ -588,6 +588,153 @@ pub fn inlay_hints(doc: &Document, text: &str, range: Range) -> Vec<InlayHint> {
     hints
 }
 
+// ---------------------------------------------------------------------------
+// 8. code actions / quick fixes
+// ---------------------------------------------------------------------------
+
+/// Produce quick-fix CodeActions for each diagnostic in `diagnostics` that we
+/// know how to repair (typo corrections + insert missing required attribute).
+pub fn code_actions(
+    doc: &Document,
+    text: &str,
+    diagnostics: &[Diagnostic],
+    uri: &Url,
+) -> CodeActionResponse {
+    let mut out: CodeActionResponse = Vec::new();
+    for diag in diagnostics {
+        suggest_for(doc, text, diag, uri, &mut out);
+    }
+    out
+}
+
+fn suggest_for(
+    doc: &Document,
+    text: &str,
+    diag: &Diagnostic,
+    uri: &Url,
+    out: &mut CodeActionResponse,
+) {
+    let msg = diag.message.as_str();
+
+    if let Some(bad) = between(msg, "Undefined link '", "'") {
+        for cand in similar(bad, doc.links.iter().map(|l| l.name.as_str())) {
+            out.push(replace_range_action(uri, diag, &cand, format!("Change to '{cand}'")));
+        }
+    } else if let Some(bad) = between(msg, "Undefined joint '", "' in mimic") {
+        for cand in similar(bad, doc.joints.iter().map(|j| j.name.as_str())) {
+            out.push(replace_range_action(uri, diag, &cand, format!("Change to '{cand}'")));
+        }
+    } else if let Some(bad) = between(msg, "Undefined link or joint '", "' in gazebo reference") {
+        let pool = doc.links.iter().map(|l| l.name.as_str())
+            .chain(doc.joints.iter().map(|j| j.name.as_str()));
+        for cand in similar(bad, pool) {
+            out.push(replace_range_action(uri, diag, &cand, format!("Change to '{cand}'")));
+        }
+    } else if let Some(bad) = between(msg, "Undefined xacro property '", "'") {
+        for cand in similar(bad, doc.xacro_properties.iter().map(|p| p.name.as_str())) {
+            // The diag range covers ${badname} including braces — wrap candidate the same way
+            out.push(replace_range_action(
+                uri,
+                diag,
+                &format!("${{{cand}}}"),
+                format!("Change to '${{{cand}}}'"),
+            ));
+        }
+    } else if msg.contains("is missing required attribute") {
+        if let Some(attr) = between(msg, "is missing required attribute '", "'") {
+            if let Some(action) = insert_attribute_action(uri, diag, text, attr) {
+                out.push(action);
+            }
+        }
+    }
+}
+
+/// Extract the substring of `s` between `prefix` and the next `suffix`.
+fn between<'a>(s: &'a str, prefix: &str, suffix: &str) -> Option<&'a str> {
+    let start = s.find(prefix)? + prefix.len();
+    let rest = &s[start..];
+    let end = rest.find(suffix)?;
+    Some(&rest[..end])
+}
+
+/// Up to 3 candidates from `pool` within edit distance roughly `len/3` (min 1).
+fn similar<'a>(target: &str, pool: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let max_dist = (target.chars().count() / 3).max(1);
+    let mut scored: Vec<(String, usize)> = pool
+        .filter_map(|c| {
+            if c == target { return None; }
+            let d = edit_distance(target, c);
+            if d <= max_dist { Some((c.to_string(), d)) } else { None }
+        })
+        .collect();
+    scored.sort_by_key(|(_, d)| *d);
+    scored.into_iter().take(3).map(|(s, _)| s).collect()
+}
+
+/// Standard DP Levenshtein, byte-wise (fine for ASCII identifier names).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.is_empty() { return b.len(); }
+    if b.is_empty() { return a.len(); }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0; b.len() + 1];
+    for (i, &ai) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &bj) in b.iter().enumerate() {
+            let cost = if ai == bj { 0 } else { 1 };
+            curr[j + 1] = (curr[j] + 1)
+                .min(prev[j + 1] + 1)
+                .min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+fn replace_range_action(uri: &Url, diag: &Diagnostic, new_text: &str, title: String) -> CodeActionOrCommand {
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(uri.clone(), vec![TextEdit { range: diag.range, new_text: new_text.to_string() }]);
+    CodeActionOrCommand::CodeAction(CodeAction {
+        title,
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: Some(vec![diag.clone()]),
+        edit: Some(WorkspaceEdit { changes: Some(changes), ..WorkspaceEdit::default() }),
+        is_preferred: Some(true),
+        ..CodeAction::default()
+    })
+}
+
+/// Build an action that inserts `attr=""` into the opening tag at `diag.range`.
+/// The diagnostic's range covers the tag name (e.g. `link` in `<link ...>`); we
+/// insert the new attribute right after it, before any existing attributes.
+fn insert_attribute_action(uri: &Url, diag: &Diagnostic, text: &str, attr: &str) -> Option<CodeActionOrCommand> {
+    let insert_pos = Position {
+        line: diag.range.end.line,
+        character: diag.range.end.character,
+    };
+    // Sanity check: the character at the diag end should be inside an opening tag
+    // (next non-whitespace before some attribute or `>`/`/>`).
+    let line = text.lines().nth(diag.range.end.line as usize)?;
+    let after = line.get(diag.range.end.character as usize..)?;
+    if !after.starts_with(|c: char| c == ' ' || c == '\t' || c == '>' || c == '/' || c == '\n') {
+        return None;
+    }
+    let edit = TextEdit {
+        range: Range::new(insert_pos, insert_pos),
+        new_text: format!(" {attr}=\"\""),
+    };
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(uri.clone(), vec![edit]);
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title: format!("Add missing attribute {attr}=\"\""),
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: Some(vec![diag.clone()]),
+        edit: Some(WorkspaceEdit { changes: Some(changes), ..WorkspaceEdit::default() }),
+        is_preferred: Some(true),
+        ..CodeAction::default()
+    }))
+}
+
 fn position_in_range(pos: Position, range: Range) -> bool {
     let after_start = pos.line > range.start.line
         || (pos.line == range.start.line && pos.character >= range.start.character);

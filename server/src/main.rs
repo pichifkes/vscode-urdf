@@ -39,6 +39,7 @@ impl LanguageServer for Backend {
                 references_provider: Some(OneOf::Left(true)),
                 rename_provider: Some(OneOf::Left(true)),
                 inlay_hint_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -149,6 +150,15 @@ impl LanguageServer for Backend {
             features::prepare_rename(doc, pos).map(|(range, placeholder)| {
                 PrepareRenameResponse::RangeWithPlaceholder { range, placeholder }
             })
+        }))
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        let diags = params.context.diagnostics;
+        let map = self.docs.lock().await;
+        Ok(map.get(&uri).map(|(doc, text)| {
+            features::code_actions(doc, text, &diags, &uri)
         }))
     }
 
