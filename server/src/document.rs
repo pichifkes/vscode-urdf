@@ -397,7 +397,7 @@ fn parse_row_col(s: &str) -> Option<(u32, u32)> {
 /// Get the LSP Range for the value of a named attribute on the given node.
 /// Searches for the attribute value inside the element's source span.
 /// Falls back to the node's own range if the value can't be located.
-fn attr_value_range(text: &str, node: &roxmltree::Node, attr_name: &str) -> Range {
+pub(crate) fn attr_value_range(text: &str, node: &roxmltree::Node, attr_name: &str) -> Range {
     let value = match node.attribute(attr_name) {
         Some(v) => v,
         None => {

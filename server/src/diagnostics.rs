@@ -791,6 +791,18 @@ mod tests {
     }
 
     #[test]
+    fn document_colors_finds_rgba_attributes() {
+        let text = r#"<robot name="r">
+  <material name="orange"><color rgba="1 0.3 0.1 1"/></material>
+  <material name="blue"><color rgba="0.2 0.2 1 0.5"/></material>
+</robot>"#;
+        let colors = crate::features::document_colors(text);
+        assert_eq!(colors.len(), 2, "expected 2 rgba swatches");
+        assert!((colors[0].color.red - 1.0).abs() < 1e-6);
+        assert!((colors[1].color.alpha - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
     fn folding_ranges_cover_multiline_elements() {
         let text = "<robot name=\"r\">\n  <link name=\"a\">\n    <visual>\n      <geometry>\n        <box size=\"1 1 1\"/>\n      </geometry>\n    </visual>\n  </link>\n  <joint name=\"j\" type=\"fixed\"/>\n</robot>\n";
         let ranges = crate::features::folding_ranges(text);

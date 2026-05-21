@@ -41,6 +41,7 @@ impl LanguageServer for Backend {
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+                color_provider: Some(ColorProviderCapability::Simple(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -152,6 +153,16 @@ impl LanguageServer for Backend {
                 PrepareRenameResponse::RangeWithPlaceholder { range, placeholder }
             })
         }))
+    }
+
+    async fn document_color(&self, params: DocumentColorParams) -> Result<Vec<ColorInformation>> {
+        let uri = params.text_document.uri;
+        let map = self.docs.lock().await;
+        Ok(map.get(&uri).map(|(_, text)| features::document_colors(text)).unwrap_or_default())
+    }
+
+    async fn color_presentation(&self, params: ColorPresentationParams) -> Result<Vec<ColorPresentation>> {
+        Ok(features::color_presentations(params.color))
     }
 
     async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {

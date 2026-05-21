@@ -589,7 +589,54 @@ pub fn inlay_hints(doc: &Document, text: &str, range: Range) -> Vec<InlayHint> {
 }
 
 // ---------------------------------------------------------------------------
-// 8. folding ranges
+// 8. document colors (color swatches + picker)
+// ---------------------------------------------------------------------------
+
+/// Find every `<color rgba="r g b a"/>` (or `<material name="..."><color/>`)
+/// and return a ColorInformation so VS Code can render a clickable swatch.
+pub fn document_colors(text: &str) -> Vec<ColorInformation> {
+    let Ok(xml) = roxmltree::Document::parse(text) else { return Vec::new(); };
+    let mut out = Vec::new();
+    walk_colors(xml.root_element(), text, &mut out);
+    out
+}
+
+fn walk_colors(node: roxmltree::Node, text: &str, out: &mut Vec<ColorInformation>) {
+    if node.is_element() && node.tag_name().name() == "color" {
+        if let Some(rgba) = node.attribute("rgba") {
+            let parts: Vec<f32> = rgba.split_whitespace()
+                .filter_map(|s| s.parse::<f32>().ok())
+                .collect();
+            if parts.len() == 4 && parts.iter().all(|v| (0.0..=1.0).contains(v)) {
+                out.push(ColorInformation {
+                    range: crate::document::attr_value_range(text, &node, "rgba"),
+                    color: Color { red: parts[0], green: parts[1], blue: parts[2], alpha: parts[3] },
+                });
+            }
+        }
+    }
+    for child in node.children() {
+        walk_colors(child, text, out);
+    }
+}
+
+/// When the user picks a new color in the picker, VS Code asks how to present
+/// it. We return one option: the space-separated `r g b a` literal that
+/// replaces the existing attribute value.
+pub fn color_presentations(color: Color) -> Vec<ColorPresentation> {
+    let fmt = |v: f32| {
+        let s = format!("{v:.3}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    };
+    vec![ColorPresentation {
+        label: format!("{} {} {} {}", fmt(color.red), fmt(color.green), fmt(color.blue), fmt(color.alpha)),
+        text_edit: None,
+        additional_text_edits: None,
+    }]
+}
+
+// ---------------------------------------------------------------------------
+// 9. folding ranges
 // ---------------------------------------------------------------------------
 
 /// One folding range per multi-line XML element. Closing tag stays visible.

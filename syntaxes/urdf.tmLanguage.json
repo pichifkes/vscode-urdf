@@ -7,9 +7,14 @@
         { "include": "#xacro-interpolation" },
         { "include": "#xacro-elements" },
         { "include": "#urdf-containers" },
+        { "include": "#urdf-structure" },
         { "include": "#urdf-subelements" },
+        { "include": "#urdf-material" },
+        { "include": "#urdf-inertial" },
         { "include": "#geometry-primitives" },
+        { "include": "#gazebo-properties" },
         { "include": "#joint-types" },
+        { "include": "#urdf-attributes" },
         { "include": "text.xml" }
     ],
     "repository": {
@@ -30,17 +35,37 @@
             "match": "(?<=</?)(robot|link|joint|transmission|gazebo)(?=[\\s/>])",
             "name": "keyword.control.urdf"
         },
+        "urdf-structure": {
+            "match": "(?<=</?)(parent|child|mimic)(?=[\\s/>])",
+            "name": "entity.name.tag.structure.urdf"
+        },
         "urdf-subelements": {
             "match": "(?<=</?)(visual|collision|inertial|geometry|origin|axis|limit|dynamics|safety_controller|calibration)(?=[\\s/>])",
             "name": "storage.type.urdf"
+        },
+        "urdf-material": {
+            "match": "(?<=</?)(material|color|texture)(?=[\\s/>])",
+            "name": "entity.name.tag.material.urdf"
+        },
+        "urdf-inertial": {
+            "match": "(?<=</?)(mass|inertia)(?=[\\s/>])",
+            "name": "entity.name.tag.inertial.urdf"
         },
         "geometry-primitives": {
             "match": "(?<=</?)(box|cylinder|sphere|mesh)(?=[\\s/>])",
             "name": "support.type.urdf"
         },
+        "gazebo-properties": {
+            "match": "(?<=</?)(mu1|mu2|mu|kp|kd|maxVel|minDepth|maxContacts|selfCollide|turnGravityOff|gravity|implicitSpringDamper|dampingFactor|laserRetro|stopCfm|stopErp|fudgeFactor)(?=[\\s/>])",
+            "name": "support.constant.gazebo"
+        },
         "joint-types": {
             "match": "(?<=[\"'])(revolute|continuous|prismatic|fixed|floating|planar)(?=[\"'])",
             "name": "constant.language.urdf"
+        },
+        "urdf-attributes": {
+            "match": "\\b(name|link|joint|type|reference|rgba|xyz|rpy|size|radius|length|filename|scale|value|lower|upper|effort|velocity|damping|friction|multiplier|offset|ixx|ixy|ixz|iyy|iyz|izz)(?==)",
+            "name": "entity.other.attribute-name.urdf"
         }
     }
 }
