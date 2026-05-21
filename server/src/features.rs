@@ -589,7 +589,43 @@ pub fn inlay_hints(doc: &Document, text: &str, range: Range) -> Vec<InlayHint> {
 }
 
 // ---------------------------------------------------------------------------
-// 8. code actions / quick fixes
+// 8. folding ranges
+// ---------------------------------------------------------------------------
+
+/// One folding range per multi-line XML element. Closing tag stays visible.
+pub fn folding_ranges(text: &str) -> Vec<FoldingRange> {
+    let Ok(xml) = roxmltree::Document::parse(text) else { return Vec::new(); };
+    let mut out = Vec::new();
+    walk_folding(xml.root_element(), text, &mut out);
+    out
+}
+
+fn walk_folding(node: roxmltree::Node, text: &str, out: &mut Vec<FoldingRange>) {
+    if node.is_element() {
+        let r = node.range();
+        let start_line = crate::document::byte_offset_to_position(text, r.start).line;
+        let end_line = crate::document::byte_offset_to_position(text, r.end).line;
+        // Only emit when there's at least one line of content between the
+        // opening and closing tags; fold end is one above the closing tag so
+        // the closing tag remains visible when collapsed.
+        if end_line > start_line + 1 {
+            out.push(FoldingRange {
+                start_line,
+                start_character: None,
+                end_line: end_line - 1,
+                end_character: None,
+                kind: None,
+                collapsed_text: None,
+            });
+        }
+    }
+    for child in node.children() {
+        walk_folding(child, text, out);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 9. code actions / quick fixes
 // ---------------------------------------------------------------------------
 
 /// Produce quick-fix CodeActions for each diagnostic in `diagnostics` that we

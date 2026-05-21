@@ -40,6 +40,7 @@ impl LanguageServer for Backend {
                 rename_provider: Some(OneOf::Left(true)),
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -151,6 +152,12 @@ impl LanguageServer for Backend {
                 PrepareRenameResponse::RangeWithPlaceholder { range, placeholder }
             })
         }))
+    }
+
+    async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
+        let uri = params.text_document.uri;
+        let map = self.docs.lock().await;
+        Ok(map.get(&uri).map(|(_, text)| features::folding_ranges(text)))
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {

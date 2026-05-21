@@ -777,6 +777,20 @@ mod tests {
     }
 
     #[test]
+    fn folding_ranges_cover_multiline_elements() {
+        let text = "<robot name=\"r\">\n  <link name=\"a\">\n    <visual>\n      <geometry>\n        <box size=\"1 1 1\"/>\n      </geometry>\n    </visual>\n  </link>\n  <joint name=\"j\" type=\"fixed\"/>\n</robot>\n";
+        let ranges = crate::features::folding_ranges(text);
+        // Expected foldable elements (multi-line): robot (0..9), link (1..7), visual (2..6), geometry (3..5)
+        let starts: Vec<u32> = ranges.iter().map(|r| r.start_line).collect();
+        assert!(starts.contains(&0), "robot should fold from line 0, got: {:?}", ranges);
+        assert!(starts.contains(&1), "link should fold from line 1, got: {:?}", ranges);
+        assert!(starts.contains(&2), "visual should fold from line 2, got: {:?}", ranges);
+        assert!(starts.contains(&3), "geometry should fold from line 3, got: {:?}", ranges);
+        // The single-line self-closing <joint> at line 8 should NOT produce a fold
+        assert!(!starts.contains(&8), "self-closing joint should not fold");
+    }
+
+    #[test]
     fn xml_parse_failure_does_not_cascade_undefined_props() {
         // Malformed XML elsewhere in the file must not turn every ${...}
         // reference into a false "Undefined xacro property" — properties
