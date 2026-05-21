@@ -227,6 +227,163 @@ pub fn hover(doc: &Document, pos: Position) -> Option<Hover> {
 }
 
 // ---------------------------------------------------------------------------
+// name_at / range_and_name_at helpers + ItemKind
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ItemKind {
+    Link,
+    Joint,
+}
+
+/// Returns the resolved (target) name and its kind for whatever is at `pos`.
+/// For a NameRef the returned name is the TARGET name (the thing being referenced).
+fn name_at(doc: &Document, pos: Position) -> Option<(String, ItemKind)> {
+    // 1. Walk joints: check NameRef ranges first.
+    for joint in &doc.joints {
+        if let Some(ref parent_ref) = joint.parent {
+            if pos_in_range(pos, parent_ref.range) {
+                return Some((parent_ref.name.clone(), ItemKind::Link));
+            }
+        }
+        if let Some(ref child_ref) = joint.child {
+            if pos_in_range(pos, child_ref.range) {
+                return Some((child_ref.name.clone(), ItemKind::Link));
+            }
+        }
+        if let Some(ref mimic_ref) = joint.mimic {
+            if pos_in_range(pos, mimic_ref.range) {
+                return Some((mimic_ref.name.clone(), ItemKind::Joint));
+            }
+        }
+    }
+
+    // 2. Walk doc.links
+    for link in &doc.links {
+        if pos_in_range(pos, link.range) {
+            return Some((link.name.clone(), ItemKind::Link));
+        }
+    }
+
+    // 3. Walk doc.joints
+    for joint in &doc.joints {
+        if pos_in_range(pos, joint.range) {
+            return Some((joint.name.clone(), ItemKind::Joint));
+        }
+    }
+
+    // 4. Materials and xacro_properties are not renameable yet.
+    None
+}
+
+/// Returns the range WHERE THE CURSOR IS and the name at that range.
+/// Checks NameRefs first, then NamedItems.
+fn range_and_name_at(doc: &Document, pos: Position) -> Option<(Range, String)> {
+    // NameRefs in joints first.
+    for joint in &doc.joints {
+        if let Some(ref parent_ref) = joint.parent {
+            if pos_in_range(pos, parent_ref.range) {
+                return Some((parent_ref.range, parent_ref.name.clone()));
+            }
+        }
+        if let Some(ref child_ref) = joint.child {
+            if pos_in_range(pos, child_ref.range) {
+                return Some((child_ref.range, child_ref.name.clone()));
+            }
+        }
+        if let Some(ref mimic_ref) = joint.mimic {
+            if pos_in_range(pos, mimic_ref.range) {
+                return Some((mimic_ref.range, mimic_ref.name.clone()));
+            }
+        }
+    }
+
+    // NamedItems.
+    for link in &doc.links {
+        if pos_in_range(pos, link.range) {
+            return Some((link.range, link.name.clone()));
+        }
+    }
+    for joint in &doc.joints {
+        if pos_in_range(pos, joint.range) {
+            return Some((joint.range, joint.name.clone()));
+        }
+    }
+
+    None
+}
+
+// ---------------------------------------------------------------------------
+// 5. references
+// ---------------------------------------------------------------------------
+
+pub fn references(doc: &Document, pos: Position) -> Vec<Range> {
+    let (name, kind) = match name_at(doc, pos) {
+        Some(v) => v,
+        None => return vec![],
+    };
+
+    let mut ranges: Vec<Range> = Vec::new();
+
+    match kind {
+        ItemKind::Link => {
+            // Definition range from doc.links
+            if let Some(link) = doc.links.iter().find(|l| l.name == name) {
+                ranges.push(link.range);
+            }
+            // Every parent/child NameRef in doc.joints with that name
+            for joint in &doc.joints {
+                if let Some(ref parent_ref) = joint.parent {
+                    if parent_ref.name == name {
+                        ranges.push(parent_ref.range);
+                    }
+                }
+                if let Some(ref child_ref) = joint.child {
+                    if child_ref.name == name {
+                        ranges.push(child_ref.range);
+                    }
+                }
+            }
+        }
+        ItemKind::Joint => {
+            // Definition range from doc.joints
+            if let Some(joint) = doc.joints.iter().find(|j| j.name == name) {
+                ranges.push(joint.range);
+            }
+            // Every mimic NameRef with that name
+            for joint in &doc.joints {
+                if let Some(ref mimic_ref) = joint.mimic {
+                    if mimic_ref.name == name {
+                        ranges.push(mimic_ref.range);
+                    }
+                }
+            }
+        }
+    }
+
+    ranges
+}
+
+// ---------------------------------------------------------------------------
+// 6. prepare_rename
+// ---------------------------------------------------------------------------
+
+pub fn prepare_rename(doc: &Document, pos: Position) -> Option<(Range, String)> {
+    range_and_name_at(doc, pos)
+}
+
+// ---------------------------------------------------------------------------
+// 7. rename
+// ---------------------------------------------------------------------------
+
+pub fn rename(doc: &Document, pos: Position, new_name: &str) -> Vec<(Range, String)> {
+    references(doc, pos)
+        .into_iter()
+        .map(|r| (r, new_name.to_string()))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // 4. completion
 // ---------------------------------------------------------------------------
 

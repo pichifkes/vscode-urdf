@@ -6,6 +6,9 @@ pub struct Document {
     pub joints: Vec<Joint>,
     pub materials: Vec<NamedItem>,
     pub xacro_properties: Vec<NamedItem>,
+    /// True when the root element declares xmlns:xacro — indicates a xacro fragment
+    /// where some links/joints may be defined in included files.
+    pub is_xacro: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +39,7 @@ pub fn parse(text: &str) -> (Document, Vec<Diagnostic>) {
         joints: Vec::new(),
         materials: Vec::new(),
         xacro_properties: Vec::new(),
+        is_xacro: false,
     };
 
     let xml = match roxmltree::Document::parse(text) {
@@ -56,6 +60,11 @@ pub fn parse(text: &str) -> (Document, Vec<Diagnostic>) {
     };
 
     let root = xml.root_element();
+
+    doc.is_xacro = root.attributes().any(|a| {
+        (a.name() == "xmlns:xacro" || a.name().starts_with("xmlns:"))
+            && a.value().contains("xacro")
+    });
 
     for node in root.children() {
         if !node.is_element() {

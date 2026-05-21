@@ -27,6 +27,8 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions::default()),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Left(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -97,6 +99,46 @@ impl LanguageServer for Backend {
         Ok(map.get(&uri).and_then(|(doc, _)| {
             let symbols = features::document_symbols(doc);
             if symbols.is_empty() { None } else { Some(DocumentSymbolResponse::Nested(symbols)) }
+        }))
+    }
+
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let pos = params.text_document_position.position;
+        let uri = params.text_document_position.text_document.uri;
+        let map = self.docs.lock().await;
+        Ok(map.get(&uri).map(|(doc, _)| {
+            features::references(doc, pos)
+                .into_iter()
+                .map(|range| Location { uri: uri.clone(), range })
+                .collect()
+        }))
+    }
+
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let pos = params.text_document_position.position;
+        let new_name = params.new_name.clone();
+        let uri = params.text_document_position.text_document.uri.clone();
+        let map = self.docs.lock().await;
+        Ok(map.get(&uri).and_then(|(doc, _)| {
+            let changes = features::rename(doc, pos, &new_name);
+            if changes.is_empty() { return None; }
+            let edits = changes.into_iter()
+                .map(|(range, new_text)| TextEdit { range, new_text })
+                .collect::<Vec<_>>();
+            let mut map = std::collections::HashMap::new();
+            map.insert(uri.clone(), edits);
+            Some(WorkspaceEdit { changes: Some(map), ..WorkspaceEdit::default() })
+        }))
+    }
+
+    async fn prepare_rename(&self, params: TextDocumentPositionParams) -> Result<Option<PrepareRenameResponse>> {
+        let pos = params.position;
+        let uri = params.text_document.uri;
+        let map = self.docs.lock().await;
+        Ok(map.get(&uri).and_then(|(doc, _)| {
+            features::prepare_rename(doc, pos).map(|(range, placeholder)| {
+                PrepareRenameResponse::RangeWithPlaceholder { range, placeholder }
+            })
         }))
     }
 

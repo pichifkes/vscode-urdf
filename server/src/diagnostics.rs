@@ -9,13 +9,20 @@ pub fn check(doc: &Document, text: &str) -> Vec<Diagnostic> {
     let joint_names: std::collections::HashSet<&str> =
         doc.joints.iter().map(|j| j.name.as_str()).collect();
 
+    // In xacro files, links/joints may come from included files — use Warning
+    let undef_severity = if doc.is_xacro {
+        DiagnosticSeverity::WARNING
+    } else {
+        DiagnosticSeverity::ERROR
+    };
+
     // 1 & 2. Undefined link references in joints (parent and child)
     for joint in &doc.joints {
         if let Some(parent_ref) = &joint.parent {
             if !link_names.contains(parent_ref.name.as_str()) {
                 diags.push(make_diag(
                     parent_ref.range,
-                    DiagnosticSeverity::ERROR,
+                    undef_severity,
                     format!("Undefined link '{}'", parent_ref.name),
                 ));
             }
@@ -24,7 +31,7 @@ pub fn check(doc: &Document, text: &str) -> Vec<Diagnostic> {
             if !link_names.contains(child_ref.name.as_str()) {
                 diags.push(make_diag(
                     child_ref.range,
-                    DiagnosticSeverity::ERROR,
+                    undef_severity,
                     format!("Undefined link '{}'", child_ref.name),
                 ));
             }
@@ -35,7 +42,7 @@ pub fn check(doc: &Document, text: &str) -> Vec<Diagnostic> {
             if !joint_names.contains(mimic_ref.name.as_str()) {
                 diags.push(make_diag(
                     mimic_ref.range,
-                    DiagnosticSeverity::ERROR,
+                    undef_severity,
                     format!("Undefined joint '{}' in mimic", mimic_ref.name),
                 ));
             }
@@ -132,8 +139,22 @@ pub fn check_schema(text: &str) -> Vec<Diagnostic> {
         Ok(d) => d,
         Err(_) => return vec![], // XML errors already reported by document::parse
     };
+
+    // Collect xacro property values so simple ${varname} can be type-checked
+    let mut props: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for node in xml.root_element().children() {
+        if node.is_element() {
+            let tag = node.tag_name();
+            if tag.name() == "property" && tag.namespace().map_or(false, |n| n.contains("xacro")) {
+                if let (Some(name), Some(value)) = (node.attribute("name"), node.attribute("value")) {
+                    props.insert(name, value);
+                }
+            }
+        }
+    }
+
     let mut diags = vec![];
-    walk_schema(xml.root_element(), text, &mut diags, false);
+    walk_schema(xml.root_element(), text, &mut diags, false, &props);
     diags
 }
 
@@ -142,6 +163,7 @@ fn walk_schema(
     text: &str,
     diags: &mut Vec<Diagnostic>,
     skip: bool,
+    props: &std::collections::HashMap<&str, &str>,
 ) {
     if node.is_text() {
         if !skip {
@@ -188,6 +210,30 @@ fn walk_schema(
                         ));
                     }
                 }
+
+                // Check 1: required attributes
+                for req in required_urdf_attrs(tag) {
+                    if node.attribute(*req).is_none() {
+                        let range = elem_name_range(text, &node);
+                        diags.push(make_diag(
+                            range,
+                            DiagnosticSeverity::ERROR,
+                            format!("Element <{tag}> is missing required attribute '{req}'"),
+                        ));
+                    }
+                }
+
+                // Check 2: attribute value types
+                for attr in node.attributes() {
+                    let aname = attr.name();
+                    if aname == "xmlns" || aname.starts_with("xmlns:") {
+                        continue;
+                    }
+                    if let Some(msg) = validate_attr_value(tag, aname, attr.value(), props) {
+                        let range = attr_name_range(text, &node, aname);
+                        diags.push(make_diag(range, DiagnosticSeverity::ERROR, msg));
+                    }
+                }
             }
             None => {
                 let range = elem_name_range(text, &node);
@@ -201,7 +247,132 @@ fn walk_schema(
     }
 
     for child in node.children() {
-        walk_schema(child, text, diags, child_skip);
+        walk_schema(child, text, diags, child_skip, props);
+    }
+}
+
+fn required_urdf_attrs(element: &str) -> &'static [&'static str] {
+    match element {
+        "robot"    => &[],   // name is optional in xacro fragments
+        "link"     => &["name"],
+        "joint"    => &["name", "type"],
+        "parent"   => &["link"],
+        "child"    => &["link"],
+        "box"      => &["size"],
+        "cylinder" => &["radius", "length"],
+        "sphere"   => &["radius"],
+        "mesh"     => &["filename"],
+        "color"    => &["rgba"],
+        "mass"     => &["value"],
+        "mimic"    => &["joint"],
+        _          => &[],
+    }
+}
+
+fn validate_attr_value(
+    element: &str,
+    attr: &str,
+    value: &str,
+    props: &std::collections::HashMap<&str, &str>,
+) -> Option<String> {
+    // If the value contains xacro substitutions, try to resolve a simple
+    // ${varname} to its property value. If resolution fails or the expression
+    // is complex (operators, multiple vars), skip type checking entirely.
+    let resolved;
+    let effective: &str = if value.contains("${") {
+        if let Some(v) = resolve_simple_xacro(value, props) {
+            resolved = v;
+            &resolved
+        } else {
+            return None;
+        }
+    } else {
+        value
+    };
+    match (element, attr) {
+        // 3 floats
+        (_, "xyz") | (_, "rpy") => expect_n_floats(effective, 3, attr),
+        // 3 positive floats
+        ("box", "size") => expect_n_floats(effective, 3, attr)
+            .or_else(|| {
+                let ok = effective.split_whitespace()
+                    .filter_map(|s| s.parse::<f64>().ok())
+                    .all(|f| f > 0.0);
+                if !ok { Some("'size' values must be positive".to_string()) } else { None }
+            }),
+        // 4 floats in [0, 1]
+        ("color", "rgba") => expect_n_floats(effective, 4, attr)
+            .or_else(|| {
+                let vals: Vec<f64> = effective.split_whitespace()
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
+                if vals.len() == 4 && vals.iter().any(|&f| f < 0.0 || f > 1.0) {
+                    Some("'rgba' values must be between 0 and 1".into())
+                } else { None }
+            }),
+        // single positive float
+        (_, "radius") | ("cylinder", "length") => expect_positive_float(effective, attr),
+        // single float (can be negative)
+        (_, "lower") | (_, "upper") | (_, "effort") | (_, "velocity")
+        | (_, "damping") | (_, "friction") | (_, "value")
+        | (_, "ixx") | (_, "ixy") | (_, "ixz") | (_, "iyy") | (_, "iyz") | (_, "izz")
+        | (_, "multiplier") | (_, "offset") => expect_float(effective, attr),
+        _ => None,
+    }
+}
+
+/// Resolve `${varname}` to its property value when the substitution is a single
+/// simple identifier (no operators, spaces, or parentheses). Returns None for
+/// complex expressions or unresolvable names — caller should skip type checking.
+fn resolve_simple_xacro<'a>(
+    value: &str,
+    props: &'a std::collections::HashMap<&str, &str>,
+) -> Option<String> {
+    let v = value.trim();
+    // Must be exactly ${varname} with nothing else
+    if !v.starts_with("${") || !v.ends_with('}') {
+        return None;
+    }
+    let inner = &v[2..v.len() - 1];
+    // Reject expressions — anything with operators or whitespace
+    if inner.contains(|c: char| matches!(c, '+' | '-' | '*' | '/' | '(' | ')' | ' ' | '\t')) {
+        return None;
+    }
+    let resolved = props.get(inner)?;
+    // Don't recurse into nested xacro expressions
+    if resolved.contains("${") {
+        return None;
+    }
+    Some(resolved.to_string())
+}
+
+fn expect_n_floats(value: &str, n: usize, attr: &str) -> Option<String> {
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    if parts.len() != n {
+        return Some(format!("'{attr}' expects {n} numbers, got {}", parts.len()));
+    }
+    let bad: Vec<&str> = parts.iter().copied()
+        .filter(|s| s.parse::<f64>().is_err())
+        .collect();
+    if !bad.is_empty() {
+        return Some(format!("'{attr}' contains non-numeric value: '{}'", bad[0]));
+    }
+    None
+}
+
+fn expect_float(value: &str, attr: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.parse::<f64>().is_err() {
+        Some(format!("'{attr}' must be a number, got '{trimmed}'"))
+    } else { None }
+}
+
+fn expect_positive_float(value: &str, attr: &str) -> Option<String> {
+    let trimmed = value.trim();
+    match trimmed.parse::<f64>() {
+        Ok(f) if f > 0.0 => None,
+        Ok(_) => Some(format!("'{attr}' must be positive")),
+        Err(_) => Some(format!("'{attr}' must be a number, got '{trimmed}'")),
     }
 }
 
