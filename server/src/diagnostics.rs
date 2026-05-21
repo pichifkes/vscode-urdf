@@ -108,7 +108,9 @@ pub fn check(doc: &Document, text: &str) -> Vec<Diagnostic> {
                     let inner_end = inner_start + rel;
                     let varname = &text[inner_start..inner_end];
                     // Skip empty or varnames with spaces
-                    if !varname.is_empty() && !varname.contains(' ') {
+                    if !varname.is_empty()
+                        && !varname.contains(|c: char| matches!(c, ' ' | '+' | '-' | '*' | '/' | '(' | ')' | '.'))
+                    {
                         if !prop_names.contains(varname) {
                             let end = inner_end + 1; // past '}'
                             let range = byte_range_to_lsp(text, start..end);
