@@ -1,4 +1,4 @@
-use tower_lsp::lsp_types::{Position, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 #[derive(Debug, Clone)]
 pub struct Document {
@@ -30,7 +30,7 @@ pub struct NameRef {
     pub range: Range,
 }
 
-pub fn parse(text: &str) -> Document {
+pub fn parse(text: &str) -> (Document, Vec<Diagnostic>) {
     let mut doc = Document {
         links: Vec::new(),
         joints: Vec::new(),
@@ -40,7 +40,19 @@ pub fn parse(text: &str) -> Document {
 
     let xml = match roxmltree::Document::parse(text) {
         Ok(d) => d,
-        Err(_) => return doc,
+        Err(e) => {
+            let msg = e.to_string();
+            let (line, col) = parse_xml_error_pos(&msg);
+            let pos = Position::new(line, col);
+            let diag = Diagnostic {
+                range: Range::new(pos, Position::new(line, col + 1)),
+                severity: Some(DiagnosticSeverity::ERROR),
+                source: Some("urdf-lsp".into()),
+                message: format!("XML parse error: {e}"),
+                ..Diagnostic::default()
+            };
+            return (doc, vec![diag]);
+        }
     };
 
     let root = xml.root_element();
@@ -153,7 +165,20 @@ pub fn parse(text: &str) -> Document {
         }
     }
 
-    doc
+    (doc, vec![])
+}
+
+/// Parse a row:col prefix from roxmltree error messages (e.g. "9:5 unexpected close tag").
+/// Returns 0-indexed (line, character). Falls back to (0, 0) if the format doesn't match.
+fn parse_xml_error_pos(msg: &str) -> (u32, u32) {
+    let mut iter = msg.splitn(3, ':');
+    let row = iter.next().and_then(|s| s.trim().parse::<u32>().ok());
+    let rest = iter.next().unwrap_or("");
+    let col = rest.split_whitespace().next().and_then(|s| s.parse::<u32>().ok());
+    match (row, col) {
+        (Some(r), Some(c)) if r > 0 => (r - 1, c.saturating_sub(1)),
+        _ => (0, 0),
+    }
 }
 
 /// Get the LSP Range for the value of a named attribute on the given node.

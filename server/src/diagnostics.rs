@@ -123,6 +123,151 @@ pub fn check(doc: &Document, text: &str) -> Vec<Diagnostic> {
     diags
 }
 
+// ---------------------------------------------------------------------------
+// Schema validation: unknown element names and unknown attributes
+// ---------------------------------------------------------------------------
+
+pub fn check_schema(text: &str) -> Vec<Diagnostic> {
+    let xml = match roxmltree::Document::parse(text) {
+        Ok(d) => d,
+        Err(_) => return vec![], // XML errors already reported by document::parse
+    };
+    let mut diags = vec![];
+    walk_schema(xml.root_element(), text, &mut diags, false);
+    diags
+}
+
+fn walk_schema(
+    node: roxmltree::Node,
+    text: &str,
+    diags: &mut Vec<Diagnostic>,
+    skip: bool,
+) {
+    if node.is_text() {
+        if !skip {
+            let content = node.text().unwrap_or("").trim();
+            if !content.is_empty() {
+                let range = byte_range_to_lsp(text, node.range());
+                diags.push(make_diag(
+                    range,
+                    DiagnosticSeverity::WARNING,
+                    "Unexpected text content in URDF element".to_string(),
+                ));
+            }
+        }
+        return;
+    }
+    if !node.is_element() {
+        return;
+    }
+
+    let tag = node.tag_name().name();
+    let ns = node.tag_name().namespace();
+
+    // xacro namespace elements are always valid
+    let is_xacro = ns.map_or(false, |n| n.contains("xacro")) || tag.starts_with("xacro:");
+
+    // Don't validate inside gazebo/plugin/transmission — they accept arbitrary XML
+    let child_skip = skip || is_xacro || matches!(tag, "gazebo" | "plugin" | "sensor" | "transmission");
+
+    if !skip && !is_xacro {
+        match known_urdf_attrs(tag) {
+            Some(valid_attrs) => {
+                for attr in node.attributes() {
+                    let aname = attr.name();
+                    // skip XML namespace declarations
+                    if aname == "xmlns" || aname.starts_with("xmlns:") {
+                        continue;
+                    }
+                    if !valid_attrs.contains(&aname) {
+                        let range = attr_name_range(text, &node, aname);
+                        diags.push(make_diag(
+                            range,
+                            DiagnosticSeverity::WARNING,
+                            format!("Unknown attribute '{aname}' on element <{tag}>"),
+                        ));
+                    }
+                }
+            }
+            None => {
+                let range = elem_name_range(text, &node);
+                diags.push(make_diag(
+                    range,
+                    DiagnosticSeverity::WARNING,
+                    format!("Unknown URDF element <{tag}>"),
+                ));
+            }
+        }
+    }
+
+    for child in node.children() {
+        walk_schema(child, text, diags, child_skip);
+    }
+}
+
+fn known_urdf_attrs(element: &str) -> Option<&'static [&'static str]> {
+    match element {
+        "robot"             => Some(&["name"]),
+        "link"              => Some(&["name"]),
+        "joint"             => Some(&["name", "type"]),
+        "visual"            => Some(&["name"]),
+        "collision"         => Some(&["name"]),
+        "inertial"          => Some(&[]),
+        "origin"            => Some(&["xyz", "rpy"]),
+        "geometry"          => Some(&[]),
+        "box"               => Some(&["size"]),
+        "cylinder"          => Some(&["radius", "length"]),
+        "sphere"            => Some(&["radius"]),
+        "mesh"              => Some(&["filename", "scale"]),
+        "material"          => Some(&["name"]),
+        "color"             => Some(&["rgba"]),
+        "texture"           => Some(&["filename"]),
+        "mass"              => Some(&["value"]),
+        "inertia"           => Some(&["ixx", "ixy", "ixz", "iyy", "iyz", "izz"]),
+        "parent"            => Some(&["link"]),
+        "child"             => Some(&["link"]),
+        "axis"              => Some(&["xyz"]),
+        "limit"             => Some(&["lower", "upper", "effort", "velocity"]),
+        "dynamics"          => Some(&["damping", "friction"]),
+        "safety_controller" => Some(&["soft_lower_limit", "soft_upper_limit", "k_position", "k_velocity"]),
+        "calibration"       => Some(&["rising", "falling"]),
+        "mimic"             => Some(&["joint", "multiplier", "offset"]),
+        "transmission"      => Some(&["name"]),
+        "gazebo"            => Some(&["reference"]),
+        _                   => None,
+    }
+}
+
+/// Range covering the tag name in the opening tag (e.g. `bosx` in `<bosx ...>`).
+fn elem_name_range(text: &str, node: &roxmltree::Node) -> Range {
+    let start = node.range().start + 1; // skip '<'
+    let name = node.tag_name().name();
+    byte_range_to_lsp(text, start..start + name.len())
+}
+
+/// Range covering the attribute name within the element source.
+fn attr_name_range(text: &str, node: &roxmltree::Node, attr_name: &str) -> Range {
+    let elem_range = node.range();
+    let elem_src = &text[elem_range.clone()];
+    let mut search = 0;
+    while search < elem_src.len() {
+        let Some(rel) = elem_src[search..].find(attr_name) else {
+            break;
+        };
+        let abs = search + rel;
+        let prev_ok = abs == 0 || elem_src.as_bytes()[abs - 1].is_ascii_whitespace();
+        let after = abs + attr_name.len();
+        let next_ok = after < elem_src.len()
+            && matches!(elem_src.as_bytes()[after], b'=' | b' ' | b'\t' | b'\n' | b'\r');
+        if prev_ok && next_ok {
+            let start = elem_range.start + abs;
+            return byte_range_to_lsp(text, start..start + attr_name.len());
+        }
+        search = abs + 1;
+    }
+    elem_name_range(text, node) // fallback
+}
+
 fn make_diag(range: Range, severity: DiagnosticSeverity, message: String) -> Diagnostic {
     Diagnostic {
         range,
