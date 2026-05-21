@@ -777,6 +777,20 @@ mod tests {
     }
 
     #[test]
+    fn xml_parse_error_position_extracted_from_tail() {
+        // roxmltree 0.20 emits messages like "expected '=' not 'e' at 26:19".
+        // Position must be parsed from the tail, not from the start of the message.
+        let text = "<robot name=\"r\">\n  <link name=\"a\"/>\n  <material nam e=\"x\"/>\n</robot>\n";
+        let (_, diags) = document::parse(text);
+        assert_eq!(diags.len(), 1, "expected one parse-error diagnostic");
+        let d = &diags[0];
+        assert!(d.message.contains("XML parse error"),
+            "expected XML parse error, got: {}", d.message);
+        assert_eq!(d.range.start.line, 2,
+            "expected diagnostic on line 2 (the <material> line), got: {:?}", d.range);
+    }
+
+    #[test]
     fn folding_ranges_cover_multiline_elements() {
         let text = "<robot name=\"r\">\n  <link name=\"a\">\n    <visual>\n      <geometry>\n        <box size=\"1 1 1\"/>\n      </geometry>\n    </visual>\n  </link>\n  <joint name=\"j\" type=\"fixed\"/>\n</robot>\n";
         let ranges = crate::features::folding_ranges(text);

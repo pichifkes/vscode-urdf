@@ -372,15 +372,26 @@ fn diag_at(text: &str, range: std::ops::Range<usize>, msg: String) -> Diagnostic
     }
 }
 
+/// Extract a (row, col) position from a roxmltree error message.
+/// Handles both `ROW:COL message` (older format) and
+/// `message at ROW:COL` (current 0.20 format). Returns 0-indexed (line, char);
+/// falls back to (0, 0) when no position can be parsed.
 fn parse_xml_error_pos(msg: &str) -> (u32, u32) {
-    let mut iter = msg.splitn(3, ':');
-    let row = iter.next().and_then(|s| s.trim().parse::<u32>().ok());
-    let rest = iter.next().unwrap_or("");
-    let col = rest.split_whitespace().next().and_then(|s| s.parse::<u32>().ok());
-    match (row, col) {
-        (Some(r), Some(c)) if r > 0 => (r - 1, c.saturating_sub(1)),
-        _ => (0, 0),
+    if let Some(at) = msg.rfind(" at ") {
+        if let Some(pos) = parse_row_col(msg[at + 4..].trim()) {
+            return pos;
+        }
     }
+    parse_row_col(msg).unwrap_or((0, 0))
+}
+
+fn parse_row_col(s: &str) -> Option<(u32, u32)> {
+    let mut parts = s.splitn(2, ':');
+    let row: u32 = parts.next()?.trim().parse().ok()?;
+    let rest = parts.next()?.trim_start();
+    let col_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let col: u32 = col_digits.parse().ok()?;
+    Some((row.saturating_sub(1), col.saturating_sub(1)))
 }
 
 /// Get the LSP Range for the value of a named attribute on the given node.
