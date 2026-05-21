@@ -49,7 +49,16 @@
                 "language": "urdf",
                 "path": "./snippets/snippets.json"
             }
-        ]
+        ],
+        "configurationDefaults": {
+            "[urdf]": {
+                "editor.quickSuggestions": {
+                    "other": "on",
+                    "comments": "off",
+                    "strings": "on"
+                }
+            }
+        }
     },
     "scripts": {
         "install:client": "npm --prefix client install",
