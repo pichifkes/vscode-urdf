@@ -759,6 +759,33 @@ mod tests {
     }
 
     #[test]
+    fn inlay_hints_on_math_expressions() {
+        use tower_lsp::lsp_types::{Position, Range};
+        let text = r#"<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="r">
+  <xacro:property name="chassis_length" value="0.335"/>
+  <xacro:property name="chassis_width" value="0.265"/>
+  <link name="base_link"/>
+  <link name="chassis">
+    <visual>
+      <origin xyz="${chassis_length/2} 0 ${chassis_width/2}"/>
+    </visual>
+  </link>
+</robot>"#;
+        let (doc, _) = document::parse(text);
+        let full = Range::new(Position::new(0, 0), Position::new(100, 0));
+        let hints = crate::features::inlay_hints(&doc, text, full);
+        // Expect two hints: 0.335/2 = 0.1675 and 0.265/2 = 0.1325
+        assert_eq!(hints.len(), 2, "expected 2 hints, got {:?}", hints.iter().map(|h| &h.label).collect::<Vec<_>>());
+        let labels: Vec<String> = hints.iter().map(|h| match &h.label {
+            tower_lsp::lsp_types::InlayHintLabel::String(s) => s.clone(),
+            _ => String::new(),
+        }).collect();
+        assert!(labels.iter().any(|l| l.contains("0.1675")), "expected 0.1675, got: {:?}", labels);
+        assert!(labels.iter().any(|l| l.contains("0.1325")), "expected 0.1325, got: {:?}", labels);
+    }
+
+    #[test]
     fn tree_valid_chain() {
         let msgs = diag_messages(r#"<?xml version="1.0"?><robot name="r">
           <link name="base_link"/>

@@ -5,12 +5,19 @@ pub struct Document {
     pub links: Vec<NamedItem>,
     pub joints: Vec<Joint>,
     pub materials: Vec<NamedItem>,
-    pub xacro_properties: Vec<NamedItem>,
+    pub xacro_properties: Vec<XacroProperty>,
     /// `reference` attribute values from `<gazebo reference="...">` elements.
     pub gazebo_refs: Vec<NameRef>,
     /// True when the root element declares xmlns:xacro — indicates a xacro fragment
     /// where some links/joints may be defined in included files.
     pub is_xacro: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct XacroProperty {
+    pub name: String,
+    pub value: String,
+    pub range: Range,
 }
 
 #[derive(Debug, Clone)]
@@ -169,23 +176,17 @@ pub fn parse(text: &str) -> (Document, Vec<Diagnostic>) {
                 }
             }
             _ => {
-                // xacro:property — tag name includes the namespace prefix in roxmltree
-                // The tag_name().name() strips the namespace, so we check the full name
                 let full_name = node.tag_name();
-                if full_name.name() == "property" && full_name.namespace() == Some("http://www.ros.org/wiki/xacro") {
+                let is_xacro_property = (full_name.name() == "property"
+                    && full_name.namespace() == Some("http://www.ros.org/wiki/xacro"))
+                    || tag == "xacro:property";
+                if is_xacro_property {
                     if let Some(name) = node.attribute("name") {
                         let range = attr_value_range(text, &node, "name");
-                        doc.xacro_properties.push(NamedItem {
+                        let value = node.attribute("value").unwrap_or("").to_string();
+                        doc.xacro_properties.push(XacroProperty {
                             name: name.to_string(),
-                            range,
-                        });
-                    }
-                } else if tag == "xacro:property" {
-                    // Fallback: some parsers present it as "xacro:property" in the name
-                    if let Some(name) = node.attribute("name") {
-                        let range = attr_value_range(text, &node, "name");
-                        doc.xacro_properties.push(NamedItem {
-                            name: name.to_string(),
+                            value,
                             range,
                         });
                     }

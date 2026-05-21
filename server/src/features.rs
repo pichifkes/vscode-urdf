@@ -537,3 +537,59 @@ fn is_element_name_trigger(prefix: &str) -> bool {
         false
     }
 }
+
+// ---------------------------------------------------------------------------
+// 7. inlay hints
+// ---------------------------------------------------------------------------
+
+/// Scan `text` for `${...}` expressions overlapping `range` and produce an
+/// inline hint showing the evaluated value right after the closing `}`.
+pub fn inlay_hints(doc: &Document, text: &str, range: Range) -> Vec<InlayHint> {
+    let mut hints = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+
+    while i + 1 < bytes.len() {
+        if bytes[i] != b'$' || bytes[i + 1] != b'{' {
+            i += 1;
+            continue;
+        }
+        let inner_start = i + 2;
+        let Some(rel) = bytes[inner_start..].iter().position(|&b| b == b'}') else {
+            break;
+        };
+        let inner_end = inner_start + rel;
+        let close = inner_end + 1;
+        let expr = &text[inner_start..inner_end];
+
+        let position = crate::document::byte_offset_to_position(text, close);
+        if position_in_range(position, range) {
+            if let Some(v) = crate::xacro_eval::eval(expr, &doc.xacro_properties) {
+                hints.push(InlayHint {
+                    position,
+                    label: InlayHintLabel::String(format!(
+                        "={}",
+                        crate::xacro_eval::format_value(v)
+                    )),
+                    kind: Some(InlayHintKind::TYPE),
+                    text_edits: None,
+                    tooltip: None,
+                    padding_left: Some(true),
+                    padding_right: None,
+                    data: None,
+                });
+            }
+        }
+        i = close;
+    }
+
+    hints
+}
+
+fn position_in_range(pos: Position, range: Range) -> bool {
+    let after_start = pos.line > range.start.line
+        || (pos.line == range.start.line && pos.character >= range.start.character);
+    let before_end = pos.line < range.end.line
+        || (pos.line == range.end.line && pos.character <= range.end.character);
+    after_start && before_end
+}

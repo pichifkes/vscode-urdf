@@ -8,6 +8,7 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 mod document;
 mod diagnostics;
 mod features;
+mod xacro_eval;
 
 #[derive(Debug)]
 struct Backend {
@@ -29,6 +30,7 @@ impl LanguageServer for Backend {
                 document_symbol_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 rename_provider: Some(OneOf::Left(true)),
+                inlay_hint_provider: Some(OneOf::Left(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -140,6 +142,13 @@ impl LanguageServer for Backend {
                 PrepareRenameResponse::RangeWithPlaceholder { range, placeholder }
             })
         }))
+    }
+
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        let uri = params.text_document.uri;
+        let range = params.range;
+        let map = self.docs.lock().await;
+        Ok(map.get(&uri).map(|(doc, text)| features::inlay_hints(doc, text, range)))
     }
 
     async fn shutdown(&self) -> Result<()> {
