@@ -100,7 +100,12 @@ pub fn check(doc: &Document, text: &str) -> Vec<Diagnostic> {
         }
     }
 
-    // 6. Gazebo reference must point to a known link or joint
+    // 6. Kinematic tree: multiple roots, disconnected links, cycles
+    if doc.links.len() > 1 {
+        kinematic_tree_check(&doc, &mut diags, undef_severity);
+    }
+
+    // 7. Gazebo reference must point to a known link or joint
     for gref in &doc.gazebo_refs {
         if !link_names.contains(gref.name.as_str()) && !joint_names.contains(gref.name.as_str()) {
             diags.push(make_diag(
@@ -147,6 +152,118 @@ pub fn check(doc: &Document, text: &str) -> Vec<Diagnostic> {
     }
 
     diags
+}
+
+fn kinematic_tree_check(
+    doc: &Document,
+    diags: &mut Vec<Diagnostic>,
+    severity: DiagnosticSeverity,
+) {
+    // Build parent→children adjacency and the set of all child link names.
+    let mut adj: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    let mut child_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for joint in &doc.joints {
+        if let (Some(p), Some(c)) = (&joint.parent, &joint.child) {
+            adj.entry(p.name.as_str()).or_default().push(c.name.as_str());
+            child_set.insert(c.name.as_str());
+        }
+    }
+
+    // Isolated links: no parent joint AND no child joints — not part of any joint at all.
+    for link in doc.links.iter()
+        .filter(|l| !child_set.contains(l.name.as_str()) && !adj.contains_key(l.name.as_str()))
+    {
+        diags.push(make_diag(
+            link.range,
+            severity,
+            format!("Link '{}' has no joints — not connected to the kinematic tree", link.name),
+        ));
+    }
+
+    // Root links: no parent joint, but DO have children (i.e., appear as joint parents).
+    let roots: Vec<&str> = doc.links.iter()
+        .filter(|l| !child_set.contains(l.name.as_str()) && adj.contains_key(l.name.as_str()))
+        .map(|l| l.name.as_str())
+        .collect();
+
+    // Multiple roots.
+    if roots.len() > 1 {
+        for link in doc.links.iter()
+            .filter(|l| !child_set.contains(l.name.as_str()) && adj.contains_key(l.name.as_str()))
+            .skip(1)
+        {
+            diags.push(make_diag(
+                link.range,
+                severity,
+                format!(
+                    "Link '{}' is a root (no parent joint); kinematic tree must have exactly one root",
+                    link.name
+                ),
+            ));
+        }
+    }
+
+    // DFS starting points = all links with no parent (roots + isolated).
+    let all_roots: Vec<&str> = doc.links.iter()
+        .filter(|l| !child_set.contains(l.name.as_str()))
+        .map(|l| l.name.as_str())
+        .collect();
+
+    // Iterative DFS: detect cycles and collect reachable links.
+    let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut on_path: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut stack: Vec<(&str, usize)> = Vec::new();
+
+    for &root in &all_roots {
+        if visited.contains(root) {
+            continue;
+        }
+        stack.push((root, 0));
+        on_path.insert(root);
+
+        while !stack.is_empty() {
+            let last = stack.len() - 1;
+            let (node, idx) = stack[last];
+            let kids: &[&str] = adj.get(node).map(|v| v.as_slice()).unwrap_or(&[]);
+
+            if idx < kids.len() {
+                stack[last].1 += 1;
+                let kid = kids[idx];
+
+                if on_path.contains(kid) {
+                    // Back edge — report the joint that closes the cycle.
+                    if let Some(joint) = doc.joints.iter().find(|j| {
+                        j.parent.as_ref().map_or(false, |p| p.name == node)
+                            && j.child.as_ref().map_or(false, |c| c.name == kid)
+                    }) {
+                        diags.push(make_diag(
+                            joint.range,
+                            DiagnosticSeverity::ERROR,
+                            format!("Joint '{}' creates a cycle in the kinematic tree", joint.name),
+                        ));
+                    }
+                } else if !visited.contains(kid) {
+                    on_path.insert(kid);
+                    stack.push((kid, 0));
+                }
+            } else {
+                visited.insert(node);
+                on_path.remove(node);
+                stack.pop();
+            }
+        }
+    }
+
+    // Links not reachable from any root are disconnected.
+    for link in &doc.links {
+        if !visited.contains(link.name.as_str()) {
+            diags.push(make_diag(
+                link.range,
+                severity,
+                format!("Link '{}' is not connected to the kinematic tree", link.name),
+            ));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -562,4 +679,74 @@ fn make_diag(range: Range, severity: DiagnosticSeverity, message: String) -> Dia
 
 fn byte_range_to_lsp(text: &str, range: std::ops::Range<usize>) -> Range {
     crate::document::byte_range_to_lsp(text, range)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document;
+
+    fn diag_messages(text: &str) -> Vec<String> {
+        let (doc, mut d) = document::parse(text);
+        d.extend(check(&doc, text));
+        d.iter().map(|d| d.message.clone()).collect()
+    }
+
+    #[test]
+    fn tree_isolated_link() {
+        // A link with no joints at all should be reported as "no joints"
+        let msgs = diag_messages(r#"<?xml version="1.0"?><robot name="r">
+          <link name="base_link"/>
+          <link name="child"/>
+          <link name="orphan"/>
+          <joint name="j1" type="fixed">
+            <parent link="base_link"/><child link="child"/>
+          </joint>
+        </robot>"#);
+        assert!(msgs.iter().any(|m| m.contains("orphan") && m.contains("no joints")),
+            "expected isolated-link diagnostic, got: {:?}", msgs);
+    }
+
+    #[test]
+    fn tree_multiple_roots() {
+        let msgs = diag_messages(r#"<?xml version="1.0"?><robot name="r">
+          <link name="root1"/>
+          <link name="root2"/>
+          <link name="child"/>
+          <joint name="j1" type="fixed">
+            <parent link="root1"/><child link="child"/>
+          </joint>
+        </robot>"#);
+        assert!(msgs.iter().any(|m| m.contains("root2") && m.contains("root")),
+            "expected multiple-roots diagnostic, got: {:?}", msgs);
+    }
+
+    #[test]
+    fn tree_cycle() {
+        let msgs = diag_messages(r#"<?xml version="1.0"?><robot name="r">
+          <link name="base_link"/>
+          <link name="link_a"/>
+          <link name="link_b"/>
+          <joint name="j1" type="fixed"><parent link="base_link"/><child link="link_a"/></joint>
+          <joint name="j2" type="fixed"><parent link="link_a"/><child link="link_b"/></joint>
+          <joint name="j3" type="fixed"><parent link="link_b"/><child link="link_a"/></joint>
+        </robot>"#);
+        assert!(msgs.iter().any(|m| m.contains("cycle")),
+            "expected cycle diagnostic, got: {:?}", msgs);
+    }
+
+    #[test]
+    fn tree_valid_chain() {
+        let msgs = diag_messages(r#"<?xml version="1.0"?><robot name="r">
+          <link name="base_link"/>
+          <link name="link_a"/>
+          <link name="link_b"/>
+          <joint name="j1" type="fixed"><parent link="base_link"/><child link="link_a"/></joint>
+          <joint name="j2" type="fixed"><parent link="link_a"/><child link="link_b"/></joint>
+        </robot>"#);
+        let tree_diags: Vec<_> = msgs.iter()
+            .filter(|m| m.contains("root") || m.contains("connected") || m.contains("cycle"))
+            .collect();
+        assert!(tree_diags.is_empty(), "expected no tree diagnostics, got: {:?}", tree_diags);
+    }
 }
