@@ -39,20 +39,28 @@ In `.xacro` files, undefined-reference errors are demoted to warnings since the 
 
 ## Requirements
 
-Linux x86_64. The bundled language server is a pre-built native binary; no Rust toolchain or ROS installation needed to run the extension.
+Linux x86_64. The .vsix bundles a pre-built native language server, so end users do **not** need a Rust toolchain or ROS installation — only VS Code.
 
 ## Installation
 
-From a local build:
+Build from source (see below) or download a `.vsix` artifact from a GitHub Actions run, then:
 
 ```sh
-git clone <this-repo> vscode-urdf
+code --install-extension urdf-*.vsix
+```
+
+## Building from source
+
+Requires a Rust toolchain (stable) and Node 18+.
+
+```sh
+git clone https://github.com/pichifkes/vscode-urdf.git
 cd vscode-urdf
-npm install --prefix client
+npm --prefix client install
 npm --prefix client run compile
 cargo build --release --manifest-path server/Cargo.toml
 mkdir -p server/bin && cp server/target/release/urdf-lsp server/bin/
-npx vsce package
+npx @vscode/vsce package --no-dependencies
 code --install-extension urdf-*.vsix
 ```
 
