@@ -475,8 +475,10 @@ fn regex_match(prefix: &str, pattern: &str) -> bool {
         r#"reference\s*=\s*"[^"]*$"# => find_attr_open(prefix, "reference"),
         r#"\$\{[^}]*$"# => {
             if let Some(open) = prefix.rfind("${") {
-                let close = prefix.rfind('}').unwrap_or(0);
-                open > close
+                match prefix.rfind('}') {
+                    Some(close) => open > close,
+                    None => true,
+                }
             } else {
                 false
             }
