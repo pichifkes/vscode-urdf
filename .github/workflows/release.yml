@@ -7,17 +7,19 @@ on:
 
 jobs:
   build:
-    name: Build ${{ matrix.vsce-target }}
+    name: Build ${{ matrix.label }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
+            label: linux-x64
             rust-targets: x86_64-unknown-linux-gnu
-            vsce-target: linux-x64
+            vsce-targets: linux-x64
           - os: macos-latest
+            label: darwin-universal
             rust-targets: x86_64-apple-darwin aarch64-apple-darwin
-            vsce-target: darwin-universal
+            vsce-targets: darwin-x64 darwin-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -41,10 +43,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             server/target
-          key: ${{ runner.os }}-${{ matrix.vsce-target }}-cargo-${{ hashFiles('server/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.label }}-cargo-${{ hashFiles('server/Cargo.lock') }}
 
       - name: Test server
-        if: matrix.vsce-target == 'linux-x64'
+        if: matrix.label == 'linux-x64'
         run: cargo test --manifest-path server/Cargo.toml --release
 
       - name: Build server (release) for each Rust target
@@ -72,16 +74,18 @@ jobs:
       - name: Build client
         run: npm run build:client
 
-      - name: Package extension
+      - name: Package extension(s)
         run: |
           npm install -g @vscode/vsce
-          vsce package --no-dependencies --target ${{ matrix.vsce-target }} --out urdf-${{ matrix.vsce-target }}.vsix
+          for t in ${{ matrix.vsce-targets }}; do
+            vsce package --no-dependencies --target "$t" --out "urdf-$t.vsix"
+          done
 
       - name: Upload .vsix
         uses: actions/upload-artifact@v4
         with:
-          name: vsix-${{ matrix.vsce-target }}
-          path: urdf-${{ matrix.vsce-target }}.vsix
+          name: vsix-${{ matrix.label }}
+          path: urdf-*.vsix
           retention-days: 7
 
   release:

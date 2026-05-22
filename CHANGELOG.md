@@ -9,7 +9,7 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 First marketplace release.
 
 - Published to VS Code Marketplace and Open VSX under publisher `Roy-Pichifkes`.
-- Platform-specific .vsix per target: `linux-x64`, `darwin-universal` (Intel + Apple Silicon, lipo'd).
+- Platform-specific .vsix per target: `linux-x64`, `darwin-x64`, `darwin-arm64`. The two Darwin .vsix files share one lipo'd universal binary built on a single Apple Silicon CI runner.
 - Native server binary bundled inside each .vsix; no Rust toolchain required for end users.
 
 ## [Unreleased]
