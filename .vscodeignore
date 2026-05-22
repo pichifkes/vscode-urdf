@@ -5,8 +5,13 @@ client/out/**/*.map
 client/src/**
 client/tsconfig.json
 client/node_modules/**
+client/package.json
+client/package-lock.json
 server/src/**
 server/target/**
+server/Cargo.toml
+server/Cargo.lock
+.github/**
 .gitignore
 vsc-extension-quickstart.md
 examples/**

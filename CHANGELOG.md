@@ -4,6 +4,14 @@ All notable changes to the "urdf" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.5.0] - 2026-05-22
+
+First marketplace release.
+
+- Published to VS Code Marketplace and Open VSX under publisher `Roy-Pichifkes`.
+- Platform-specific .vsix per target: `linux-x64`, `darwin-x64`, `darwin-arm64`.
+- Native server binary bundled inside each .vsix; no Rust toolchain required for end users.
+
 ## [Unreleased]
 
 ### 0.4.0-dev

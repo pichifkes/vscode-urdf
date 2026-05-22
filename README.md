@@ -4,7 +4,7 @@ Language server for [URDF](http://wiki.ros.org/urdf) and [xacro](http://wiki.ros
 
 Forked from [OTL/vscode-urdf](https://github.com/OTL/vscode-urdf) (which provided XML highlighting and snippets) and rebuilt around a Rust LSP server.
 
-> **Platform:** Linux only.
+> **Platforms:** Linux x64, macOS x64 (Intel), macOS arm64 (Apple Silicon).
 
 ## Features
 
@@ -39,11 +39,23 @@ In `.xacro` files, undefined-reference errors are demoted to warnings since the 
 
 ## Requirements
 
-Linux x86_64. The .vsix bundles a pre-built native language server, so end users do **not** need a Rust toolchain or ROS installation — only VS Code.
+Linux x64, macOS x64, or macOS arm64. The .vsix bundles a pre-built native language server, so end users do **not** need a Rust toolchain or ROS installation — only VS Code.
 
 ## Installation
 
-Build from source (see below) or download a `.vsix` artifact from a GitHub Actions run, then:
+From the VS Code Marketplace:
+
+```sh
+code --install-extension Roy-Pichifkes.urdf
+```
+
+Or from Open VSX (VSCodium / Cursor / code-server):
+
+```sh
+codium --install-extension Roy-Pichifkes.urdf
+```
+
+Or sideload a `.vsix` from the [GitHub Releases](https://github.com/pichifkes/vscode-urdf/releases) page:
 
 ```sh
 code --install-extension urdf-*.vsix

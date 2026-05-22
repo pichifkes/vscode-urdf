@@ -1,9 +1,9 @@
 {
     "name": "urdf",
-    "displayName": "URDF",
-    "description": "URDF/xacro language support with semantic diagnostics (Linux only)",
-    "version": "0.4.0-dev",
-    "publisher": "smilerobotics",
+    "displayName": "URDF / xacro Language Server",
+    "description": "URDF and xacro language server: diagnostics, completion, hover, go-to-definition, rename, inlay hints, quick-fixes.",
+    "version": "0.5.0",
+    "publisher": "Roy-Pichifkes",
     "engines": {
         "vscode": "^1.82.0"
     },
@@ -64,6 +64,9 @@
         "install:client": "npm --prefix client install",
         "build:client": "npm --prefix client run compile",
         "build:server": "cargo build --manifest-path server/Cargo.toml",
-        "build": "npm run build:server && npm run build:client"
+        "build:server:release": "cargo build --release --manifest-path server/Cargo.toml",
+        "stage:server": "mkdir -p server/bin && cp server/target/release/urdf-lsp server/bin/urdf-lsp && chmod +x server/bin/urdf-lsp",
+        "build": "npm run build:server && npm run build:client",
+        "package": "npm run build:client && npm run build:server:release && npm run stage:server && npx @vscode/vsce package --no-dependencies"
     }
 }
