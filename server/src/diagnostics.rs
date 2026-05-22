@@ -268,17 +268,52 @@ pub fn check(doc: &Document, text: &str) -> Vec<Diagnostic> {
                 }
                 if let Some(inner_end) = close {
                     let varname = &text[inner_start..inner_end];
-                    if !varname.is_empty()
-                        && !varname.contains(|c: char| matches!(c, ' ' | '+' | '-' | '*' | '/' | '(' | ')' | '.'))
-                    {
+                    let is_complex = varname.contains(|c: char| {
+                        matches!(c, ' ' | '+' | '-' | '*' | '/' | '(' | ')' | '.')
+                    });
+                    if !varname.is_empty() && !is_complex {
+                        // Simple single-identifier: ${varname}
                         if !prop_names.contains(varname) {
-                            let end = inner_end + 1;
-                            let range = byte_range_to_lsp(text, start..end);
+                            let range = byte_range_to_lsp(text, start..inner_end + 1);
                             diags.push(make_diag(
                                 range,
                                 DiagnosticSeverity::ERROR,
                                 format!("Undefined xacro property '{}'", varname),
                             ));
+                        }
+                    } else if is_complex {
+                        // Complex expression: extract every identifier and check each one.
+                        let expr = varname.as_bytes();
+                        let mut k = 0;
+                        while k < expr.len() {
+                            if expr[k].is_ascii_alphabetic() || expr[k] == b'_' {
+                                let id_start = k;
+                                while k < expr.len()
+                                    && (expr[k].is_ascii_alphanumeric() || expr[k] == b'_')
+                                {
+                                    k += 1;
+                                }
+                                let id = &varname[id_start..k];
+                                if matches!(
+                                    id,
+                                    "pi" | "sin" | "cos" | "tan" | "abs"
+                                        | "sqrt" | "radians" | "degrees"
+                                ) {
+                                    continue;
+                                }
+                                if !prop_names.contains(id) {
+                                    let byte_start = inner_start + id_start;
+                                    let byte_end = inner_start + k;
+                                    let range = byte_range_to_lsp(text, byte_start..byte_end);
+                                    diags.push(make_diag(
+                                        range,
+                                        DiagnosticSeverity::ERROR,
+                                        format!("Undefined xacro property '{}'", id),
+                                    ));
+                                }
+                            } else {
+                                k += 1;
+                            }
                         }
                     }
                     i = inner_end + 1;
@@ -849,24 +884,25 @@ mod tests {
     }
 
     #[test]
-    fn tag_mismatch_points_to_opening_tag() {
-        // The misspelled opening tag is on line 1 (0-indexed), the closing tag matches
-        // the original name. The diagnostic should be on the opening tag, not the closing.
+    fn tag_mismatch_points_to_close_tag() {
+        // Open tag has a typo (<mateaaaaaaa>), close tag is </material>.
+        // Diagnostic lands on the close tag (line 3, 0-indexed) naming both sides,
+        // so the user can see what was open and what was written.
         let text = "<robot name=\"r\">\n  <mateaaaaaaa name=\"x\">\n    <color rgba=\"1 1 1 1\"/>\n  </material>\n</robot>\n";
         let (_, diags) = document::parse(text);
         assert_eq!(diags.len(), 1, "expected exactly one diagnostic, got {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>());
         assert!(diags[0].message.contains("mateaaaaaaa") && diags[0].message.contains("material"),
             "expected mismatch message naming both tags, got: {}", diags[0].message);
-        assert_eq!(diags[0].range.start.line, 1, "expected diagnostic on the opening tag line, got: {:?}",
+        assert_eq!(diags[0].range.start.line, 3, "expected diagnostic on the closing tag line, got: {:?}",
             diags[0].range);
     }
 
     #[test]
-    fn tag_unclosed_points_to_opening() {
+    fn tag_unclosed_mismatch_is_flagged() {
         let text = "<robot>\n  <link name=\"foo\">\n</robot>\n";
         let (_, diags) = document::parse(text);
-        assert!(diags.iter().any(|d| d.message.contains("never closed") || d.message.contains("Mismatched")),
+        assert!(diags.iter().any(|d| d.message.contains("never closed") || d.message.contains("Unexpected closing tag")),
             "expected unclosed/mismatch diagnostic, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -965,6 +1001,54 @@ mod tests {
         let labels: Vec<&str> = items.iter().map(|c| c.label.as_str()).collect();
         assert!(labels.contains(&"wheel_radius"), "expected wheel_radius in completions, got: {:?}", labels);
         assert!(labels.contains(&"wheel_thickness"), "expected wheel_thickness in completions, got: {:?}", labels);
+    }
+
+    #[test]
+    fn undefined_var_inside_complex_expression_is_flagged() {
+        let text = r#"<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="r">
+  <xacro:property name="chassis_length" value="0.35"/>
+  <xacro:property name="chassis_mass"   value="1"/>
+  <link name="x">
+    <inertial>
+      <inertia ixx="${(1/12)*chassis_mass*(chassis_width*chassis_length)}" ixy="0" ixz="0"
+               iyy="0" iyz="0" izz="0"/>
+    </inertial>
+  </link>
+</robot>"#;
+        let (doc, mut d) = document::parse(text);
+        d.extend(check(&doc, text));
+        assert!(
+            d.iter().any(|m| m.message.contains("chassis_width") && m.message.contains("Undefined")),
+            "expected chassis_width to be flagged as undefined, got: {:?}",
+            d.iter().map(|x| &x.message).collect::<Vec<_>>()
+        );
+        assert!(
+            !d.iter().any(|m| m.message.contains("chassis_length") && m.message.contains("Undefined")),
+            "chassis_length is defined and must not be flagged"
+        );
+        assert!(
+            !d.iter().any(|m| m.message.contains("chassis_mass") && m.message.contains("Undefined")),
+            "chassis_mass is defined and must not be flagged"
+        );
+    }
+
+    #[test]
+    fn builtins_in_complex_expression_not_flagged() {
+        let text = r#"<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="r">
+  <xacro:property name="angle" value="1.57"/>
+  <link name="x">
+    <inertial>
+      <inertia ixx="${sin(angle) + pi}" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
+  </link>
+</robot>"#;
+        let (doc, mut d) = document::parse(text);
+        d.extend(check(&doc, text));
+        assert!(
+            !d.iter().any(|m| m.message.contains("Undefined")),
+            "sin/pi are builtins and must not be flagged, got: {:?}",
+            d.iter().map(|x| &x.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]

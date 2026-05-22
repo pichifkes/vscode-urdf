@@ -339,12 +339,12 @@ fn scan_tag_balance(text: &str) -> Vec<Diagnostic> {
 
             match stack.pop() {
                 Some((open_name, _, _)) if open_name == name => {}
-                Some((open_name, open_ns, open_ne)) => {
+                Some((open_name, _open_ns, _open_ne)) => {
                     return vec![diag_at(
                         text,
-                        open_ns..open_ne,
+                        name_start..name_end,
                         format!(
-                            "Mismatched tag: opened <{open_name}> but closed with </{name}>"
+                            "Unexpected closing tag </{name}>: the open element is <{open_name}>"
                         ),
                     )];
                 }
