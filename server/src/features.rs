@@ -234,9 +234,11 @@ pub enum ItemKind {
     Joint,
 }
 
-/// Returns the resolved (target) name and its kind for whatever is at `pos`.
-/// For a NameRef the returned name is the TARGET name (the thing being referenced).
-fn name_at(doc: &Document, pos: Position) -> Option<(String, ItemKind)> {
+/// Returns the resolved (target) name and its kind for whatever entity is at `pos`.
+/// For a NameRef the returned name is the TARGET (the thing being referenced).
+/// For a definition site (`<link name="…">`) it returns the defined name itself.
+/// Used by main.rs for cross-file goto-def and hover when same-file lookup fails.
+pub fn entity_at(doc: &Document, pos: Position) -> Option<(String, ItemKind)> {
     // 1. Walk joints: check NameRef ranges first.
     for joint in &doc.joints {
         if let Some(ref parent_ref) = joint.parent {
@@ -316,7 +318,7 @@ fn range_and_name_at(doc: &Document, pos: Position) -> Option<(Range, String)> {
 // ---------------------------------------------------------------------------
 
 pub fn references(doc: &Document, pos: Position) -> Vec<Range> {
-    let (name, kind) = match name_at(doc, pos) {
+    let (name, kind) = match entity_at(doc, pos) {
         Some(v) => v,
         None => return vec![],
     };
@@ -393,6 +395,20 @@ pub fn completion(doc: &Document, pos: Position, text: &str) -> Vec<CompletionIt
     let line_start = text[..cursor_offset].rfind('\n').map(|p| p + 1).unwrap_or(0);
     let prefix = &text[line_start..cursor_offset];
 
+    // Enum completions: type= inside <joint …> → offer all valid joint types.
+    if find_attr_open(prefix, "type") {
+        if current_tag_name(text, cursor_offset).as_deref() == Some("joint") {
+            return crate::diagnostics::JOINT_TYPES
+                .iter()
+                .map(|&t| CompletionItem {
+                    label: t.to_string(),
+                    kind: Some(CompletionItemKind::ENUM_MEMBER),
+                    ..CompletionItem::default()
+                })
+                .collect();
+        }
+    }
+
     let link_re      = regex_match(prefix, r#"link\s*=\s*"[^"]*$"#);
     let joint_re     = regex_match(prefix, r#"joint\s*=\s*"[^"]*$"#);
     let reference_re = regex_match(prefix, r#"reference\s*=\s*"[^"]*$"#);
@@ -459,6 +475,42 @@ pub fn completion(doc: &Document, pos: Position, text: &str) -> Vec<CompletionIt
             vec![]
         }
     }
+}
+
+/// Scan backwards through `text` from `cursor_offset` to find the name of the
+/// innermost unclosed XML opening tag. Used to determine attribute-value
+/// completion context (e.g. "are we inside a `<joint>` tag?").
+fn current_tag_name(text: &str, cursor_offset: usize) -> Option<String> {
+    let before = &text[..cursor_offset.min(text.len())];
+    let bytes = before.as_bytes();
+    let mut i = bytes.len();
+    while i > 0 {
+        i -= 1;
+        if bytes[i] != b'<' {
+            continue;
+        }
+        let after = i + 1;
+        if after >= bytes.len() {
+            continue;
+        }
+        // Skip closing tags </…>, processing instructions <?…>, and comments <!--…>
+        if matches!(bytes[after], b'/' | b'!' | b'?') {
+            continue;
+        }
+        // Read the tag name (alphanumeric + _ : -)
+        let name_start = after;
+        let mut name_end = name_start;
+        while name_end < bytes.len()
+            && (bytes[name_end].is_ascii_alphanumeric()
+                || matches!(bytes[name_end], b'_' | b':' | b'-'))
+        {
+            name_end += 1;
+        }
+        if name_end > name_start {
+            return Some(before[name_start..name_end].to_string());
+        }
+    }
+    None
 }
 
 fn regex_match(prefix: &str, pattern: &str) -> bool {
@@ -856,6 +908,37 @@ mod tests {
         assert!(!find_attr_open("<parent parent_link=\"foo", "link"));
         // Closed quote → not inside.
         assert!(!find_attr_open("<parent link=\"foo\" ", "link"));
+    }
+
+    #[test]
+    fn completion_joint_type_offers_all_types() {
+        use tower_lsp::lsp_types::Position;
+        // Cursor is inside the type="" attribute value of a <joint> element.
+        let text = "<robot name=\"r\">\n  <joint name=\"j\" type=\"";
+        let (doc, _) = crate::document::parse(text);
+        // Line 1, column at end of `type="`
+        let line = "  <joint name=\"j\" type=\"";
+        let col = line.len() as u32;
+        let items = crate::features::completion(&doc, Position::new(1, col), text);
+        let labels: Vec<&str> = items.iter().map(|c| c.label.as_str()).collect();
+        for t in crate::diagnostics::JOINT_TYPES {
+            assert!(labels.contains(t), "expected joint type '{}' in completions, got: {:?}", t, labels);
+        }
+    }
+
+    #[test]
+    fn completion_type_outside_joint_is_empty() {
+        use tower_lsp::lsp_types::Position;
+        // type= inside <transmission> should NOT offer joint types (returns empty → no dropdown).
+        let text = "<robot name=\"r\">\n  <transmission name=\"t\" type=\"";
+        let (doc, _) = crate::document::parse(text);
+        let line = "  <transmission name=\"t\" type=\"";
+        let col = line.len() as u32;
+        let items = crate::features::completion(&doc, Position::new(1, col), text);
+        // Joint-type completions should NOT be returned for <transmission type=
+        let has_joint_type = items.iter().any(|c| c.label == "revolute" || c.label == "fixed");
+        assert!(!has_joint_type, "joint types should not appear inside <transmission type=, got: {:?}",
+            items.iter().map(|c| c.label.as_str()).collect::<Vec<_>>());
     }
 
     #[test]

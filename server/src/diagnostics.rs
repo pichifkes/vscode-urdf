@@ -141,7 +141,27 @@ pub const JOINT_TYPES: &[&str] = &[
     "revolute", "continuous", "prismatic", "fixed", "floating", "planar",
 ];
 
-pub fn check(doc: &Document, text: &str) -> Vec<Diagnostic> {
+/// Workspace-wide entity names passed to [`check`] to suppress cross-file
+/// false-positive diagnostics. All sets may be empty; use `Default::default()`
+/// for a no-workspace context.
+#[derive(Default)]
+pub struct WorkspaceNames {
+    pub links:  std::collections::HashSet<String>,
+    pub joints: std::collections::HashSet<String>,
+    pub props:  std::collections::HashSet<String>,
+}
+
+/// Run semantic checks on a parsed document.
+///
+/// `ws` carries entity names known across the whole workspace (populated from
+/// all open and scanned files). A reference not found in this file but present
+/// in `ws` is silently suppressed — the entity lives in an included/companion
+/// file. Pass `None` for fully isolated (no-workspace) analysis.
+pub fn check(
+    doc: &Document,
+    text: &str,
+    ws: Option<&WorkspaceNames>,
+) -> Vec<Diagnostic> {
     let mut diags: Vec<Diagnostic> = Vec::new();
 
     let link_names: std::collections::HashSet<&str> =
@@ -150,6 +170,7 @@ pub fn check(doc: &Document, text: &str) -> Vec<Diagnostic> {
         doc.joints.iter().map(|j| j.name.as_str()).collect();
 
     // In xacro files, links/joints may come from included files — use Warning
+    // for refs not found anywhere in the workspace.
     let undef_severity = if doc.is_xacro {
         DiagnosticSeverity::WARNING
     } else {
@@ -160,31 +181,40 @@ pub fn check(doc: &Document, text: &str) -> Vec<Diagnostic> {
     for joint in &doc.joints {
         if let Some(parent_ref) = &joint.parent {
             if !link_names.contains(parent_ref.name.as_str()) {
-                diags.push(make_diag(
-                    parent_ref.range,
-                    undef_severity,
-                    format!("Undefined link '{}'", parent_ref.name),
-                ));
+                let in_ws = ws.map_or(false, |w| w.links.contains(parent_ref.name.as_str()));
+                if !in_ws {
+                    diags.push(make_diag(
+                        parent_ref.range,
+                        undef_severity,
+                        format!("Undefined link '{}'", parent_ref.name),
+                    ));
+                }
             }
         }
         if let Some(child_ref) = &joint.child {
             if !link_names.contains(child_ref.name.as_str()) {
-                diags.push(make_diag(
-                    child_ref.range,
-                    undef_severity,
-                    format!("Undefined link '{}'", child_ref.name),
-                ));
+                let in_ws = ws.map_or(false, |w| w.links.contains(child_ref.name.as_str()));
+                if !in_ws {
+                    diags.push(make_diag(
+                        child_ref.range,
+                        undef_severity,
+                        format!("Undefined link '{}'", child_ref.name),
+                    ));
+                }
             }
         }
 
         // 3. Undefined joint mimic reference
         if let Some(mimic_ref) = &joint.mimic {
             if !joint_names.contains(mimic_ref.name.as_str()) {
-                diags.push(make_diag(
-                    mimic_ref.range,
-                    undef_severity,
-                    format!("Undefined joint '{}' in mimic", mimic_ref.name),
-                ));
+                let in_ws = ws.map_or(false, |w| w.joints.contains(mimic_ref.name.as_str()));
+                if !in_ws {
+                    diags.push(make_diag(
+                        mimic_ref.range,
+                        undef_severity,
+                        format!("Undefined joint '{}' in mimic", mimic_ref.name),
+                    ));
+                }
             }
         }
 
@@ -235,7 +265,11 @@ pub fn check(doc: &Document, text: &str) -> Vec<Diagnostic> {
 
     // 7. Gazebo reference must point to a known link or joint
     for gref in &doc.gazebo_refs {
-        if !link_names.contains(gref.name.as_str()) && !joint_names.contains(gref.name.as_str()) {
+        let in_file = link_names.contains(gref.name.as_str()) || joint_names.contains(gref.name.as_str());
+        let in_ws   = ws.map_or(false, |w| {
+            w.links.contains(gref.name.as_str()) || w.joints.contains(gref.name.as_str())
+        });
+        if !in_file && !in_ws {
             diags.push(make_diag(
                 gref.range,
                 undef_severity,
@@ -274,12 +308,15 @@ pub fn check(doc: &Document, text: &str) -> Vec<Diagnostic> {
                     if !varname.is_empty() && !is_complex {
                         // Simple single-identifier: ${varname}
                         if !prop_names.contains(varname) {
-                            let range = byte_range_to_lsp(text, start..inner_end + 1);
-                            diags.push(make_diag(
-                                range,
-                                DiagnosticSeverity::ERROR,
-                                format!("Undefined xacro property '{}'", varname),
-                            ));
+                            let in_ws = ws.map_or(false, |w| w.props.contains(varname));
+                            if !in_ws {
+                                let range = byte_range_to_lsp(text, start..inner_end + 1);
+                                diags.push(make_diag(
+                                    range,
+                                    undef_severity,
+                                    format!("Undefined xacro property '{}'", varname),
+                                ));
+                            }
                         }
                     } else if is_complex {
                         // Complex expression: extract every identifier and check each one.
@@ -302,14 +339,17 @@ pub fn check(doc: &Document, text: &str) -> Vec<Diagnostic> {
                                     continue;
                                 }
                                 if !prop_names.contains(id) {
-                                    let byte_start = inner_start + id_start;
-                                    let byte_end = inner_start + k;
-                                    let range = byte_range_to_lsp(text, byte_start..byte_end);
-                                    diags.push(make_diag(
-                                        range,
-                                        DiagnosticSeverity::ERROR,
-                                        format!("Undefined xacro property '{}'", id),
-                                    ));
+                                    let in_ws = ws.map_or(false, |w| w.props.contains(id));
+                                    if !in_ws {
+                                        let byte_start = inner_start + id_start;
+                                        let byte_end = inner_start + k;
+                                        let range = byte_range_to_lsp(text, byte_start..byte_end);
+                                        diags.push(make_diag(
+                                            range,
+                                            undef_severity,
+                                            format!("Undefined xacro property '{}'", id),
+                                        ));
+                                    }
                                 }
                             } else {
                                 k += 1;
@@ -836,7 +876,7 @@ mod tests {
 
     fn diag_messages(text: &str) -> Vec<String> {
         let (doc, mut d) = document::parse(text);
-        d.extend(check(&doc, text));
+        d.extend(check(&doc, text, None));
         d.iter().map(|d| d.message.clone()).collect()
     }
 
@@ -961,7 +1001,7 @@ mod tests {
 </robot>"#;
         let (doc, mut diags) = document::parse(text);
         if doc.parse_ok {
-            diags.extend(check(&doc, text));
+            diags.extend(check(&doc, text, None));
         }
         let undef: Vec<_> = diags.iter().filter(|d| d.message.contains("Undefined xacro property")).collect();
         assert!(undef.is_empty(),
@@ -978,7 +1018,7 @@ mod tests {
   </geometry></visual></link>
 </robot>"#;
         let (doc, mut d) = document::parse(text);
-        d.extend(check(&doc, text));
+        d.extend(check(&doc, text, None));
         assert!(d.iter().any(|m| m.message.contains("Unclosed xacro expression")),
             "expected unclosed-expression diagnostic, got: {:?}",
             d.iter().map(|x| &x.message).collect::<Vec<_>>());
@@ -1016,7 +1056,7 @@ mod tests {
   </link>
 </robot>"#;
         let (doc, mut d) = document::parse(text);
-        d.extend(check(&doc, text));
+        d.extend(check(&doc, text, None));
         assert!(
             d.iter().any(|m| m.message.contains("chassis_width") && m.message.contains("Undefined")),
             "expected chassis_width to be flagged as undefined, got: {:?}",
@@ -1043,7 +1083,7 @@ mod tests {
   </link>
 </robot>"#;
         let (doc, mut d) = document::parse(text);
-        d.extend(check(&doc, text));
+        d.extend(check(&doc, text, None));
         assert!(
             !d.iter().any(|m| m.message.contains("Undefined")),
             "sin/pi are builtins and must not be flagged, got: {:?}",

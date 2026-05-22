@@ -4,6 +4,12 @@ All notable changes to the "urdf" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.5.2] - 2026-05-22
+
+### Added
+- **Joint type dropdown**: typing `type="` inside a `<joint>` element now shows a completion dropdown with all 6 valid URDF joint types (`revolute`, `continuous`, `prismatic`, `fixed`, `floating`, `planar`).
+- **Workspace cross-file analysis**: links, joints, and xacro properties defined in other open or workspace-scanned files no longer produce false-positive diagnostics. On startup the server scans all `.urdf`/`.xacro` files in the workspace; files opened later update the index incrementally. Cross-file references in `.xacro` fragment files are suppressed entirely when the entity is found in the workspace.
+
 ## [0.5.1] - 2026-05-22
 
 ### Fixed
