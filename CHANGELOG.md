@@ -4,6 +4,12 @@ All notable changes to the "urdf" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.5.1] - 2026-05-22
+
+### Fixed
+- Tag-mismatch diagnostic now points at the unexpected closing tag (where the problem is), not the last open element on the stack.
+- Undefined xacro properties inside complex `${...}` expressions (e.g. `${(1/12)*mass*(width*typo_var)}`) are now flagged; previously only single-identifier expressions like `${typo_var}` were checked.
+
 ## [0.5.0] - 2026-05-22
 
 First marketplace release.

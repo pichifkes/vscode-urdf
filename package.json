@@ -2,7 +2,7 @@
     "name": "urdf",
     "displayName": "URDF / xacro Language Server",
     "description": "URDF and xacro language server: diagnostics, completion, hover, go-to-definition, rename, inlay hints, quick-fixes.",
-    "version": "0.5.0",
+    "version": "0.5.1",
     "publisher": "Roy-Pichifkes",
     "engines": {
         "vscode": "^1.82.0"
