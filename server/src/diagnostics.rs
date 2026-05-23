@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Range};
 use crate::document::Document;
+use crate::workspace::WorkspaceIndex;
 
 /// Type-kind tag for a Gazebo property element, used by `validate_gazebo_text`.
 #[derive(Copy, Clone)]
@@ -141,26 +142,16 @@ pub const JOINT_TYPES: &[&str] = &[
     "revolute", "continuous", "prismatic", "fixed", "floating", "planar",
 ];
 
-/// Workspace-wide entity names passed to [`check`] to suppress cross-file
-/// false-positive diagnostics. All sets may be empty; use `Default::default()`
-/// for a no-workspace context.
-#[derive(Default)]
-pub struct WorkspaceNames {
-    pub links:  std::collections::HashSet<String>,
-    pub joints: std::collections::HashSet<String>,
-    pub props:  std::collections::HashSet<String>,
-}
-
 /// Run semantic checks on a parsed document.
 ///
-/// `ws` carries entity names known across the whole workspace (populated from
-/// all open and scanned files). A reference not found in this file but present
-/// in `ws` is silently suppressed — the entity lives in an included/companion
-/// file. Pass `None` for fully isolated (no-workspace) analysis.
+/// `ws` is the cross-workspace entity index (populated from all open and scanned
+/// files). A reference not found in this file but present in `ws` is silently
+/// suppressed — the entity lives in an included/companion file. Pass `None` for
+/// fully isolated (no-workspace) analysis.
 pub fn check(
     doc: &Document,
     text: &str,
-    ws: Option<&WorkspaceNames>,
+    ws: Option<&WorkspaceIndex>,
 ) -> Vec<Diagnostic> {
     let mut diags: Vec<Diagnostic> = Vec::new();
 
@@ -180,41 +171,38 @@ pub fn check(
     // 1 & 2. Undefined link references in joints (parent and child)
     for joint in &doc.joints {
         if let Some(parent_ref) = &joint.parent {
-            if !link_names.contains(parent_ref.name.as_str()) {
-                let in_ws = ws.map_or(false, |w| w.links.contains(parent_ref.name.as_str()));
-                if !in_ws {
-                    diags.push(make_diag(
-                        parent_ref.range,
-                        undef_severity,
-                        format!("Undefined link '{}'", parent_ref.name),
-                    ));
-                }
+            if !link_names.contains(parent_ref.name.as_str())
+                && !ws.is_some_and(|w| w.has_link(&parent_ref.name))
+            {
+                diags.push(make_diag(
+                    parent_ref.range,
+                    undef_severity,
+                    format!("Undefined link '{}'", parent_ref.name),
+                ));
             }
         }
         if let Some(child_ref) = &joint.child {
-            if !link_names.contains(child_ref.name.as_str()) {
-                let in_ws = ws.map_or(false, |w| w.links.contains(child_ref.name.as_str()));
-                if !in_ws {
-                    diags.push(make_diag(
-                        child_ref.range,
-                        undef_severity,
-                        format!("Undefined link '{}'", child_ref.name),
-                    ));
-                }
+            if !link_names.contains(child_ref.name.as_str())
+                && !ws.is_some_and(|w| w.has_link(&child_ref.name))
+            {
+                diags.push(make_diag(
+                    child_ref.range,
+                    undef_severity,
+                    format!("Undefined link '{}'", child_ref.name),
+                ));
             }
         }
 
         // 3. Undefined joint mimic reference
         if let Some(mimic_ref) = &joint.mimic {
-            if !joint_names.contains(mimic_ref.name.as_str()) {
-                let in_ws = ws.map_or(false, |w| w.joints.contains(mimic_ref.name.as_str()));
-                if !in_ws {
-                    diags.push(make_diag(
-                        mimic_ref.range,
-                        undef_severity,
-                        format!("Undefined joint '{}' in mimic", mimic_ref.name),
-                    ));
-                }
+            if !joint_names.contains(mimic_ref.name.as_str())
+                && !ws.is_some_and(|w| w.has_joint(&mimic_ref.name))
+            {
+                diags.push(make_diag(
+                    mimic_ref.range,
+                    undef_severity,
+                    format!("Undefined joint '{}' in mimic", mimic_ref.name),
+                ));
             }
         }
 
@@ -266,9 +254,7 @@ pub fn check(
     // 7. Gazebo reference must point to a known link or joint
     for gref in &doc.gazebo_refs {
         let in_file = link_names.contains(gref.name.as_str()) || joint_names.contains(gref.name.as_str());
-        let in_ws   = ws.map_or(false, |w| {
-            w.links.contains(gref.name.as_str()) || w.joints.contains(gref.name.as_str())
-        });
+        let in_ws   = ws.is_some_and(|w| w.has_link(&gref.name) || w.has_joint(&gref.name));
         if !in_file && !in_ws {
             diags.push(make_diag(
                 gref.range,
@@ -307,16 +293,15 @@ pub fn check(
                     });
                     if !varname.is_empty() && !is_complex {
                         // Simple single-identifier: ${varname}
-                        if !prop_names.contains(varname) {
-                            let in_ws = ws.map_or(false, |w| w.props.contains(varname));
-                            if !in_ws {
-                                let range = byte_range_to_lsp(text, start..inner_end + 1);
-                                diags.push(make_diag(
-                                    range,
-                                    undef_severity,
-                                    format!("Undefined xacro property '{}'", varname),
-                                ));
-                            }
+                        if !prop_names.contains(varname)
+                            && !ws.is_some_and(|w| w.has_prop(varname))
+                        {
+                            let range = byte_range_to_lsp(text, start..inner_end + 1);
+                            diags.push(make_diag(
+                                range,
+                                undef_severity,
+                                format!("Undefined xacro property '{}'", varname),
+                            ));
                         }
                     } else if is_complex {
                         // Complex expression: extract every identifier and check each one.
@@ -338,18 +323,17 @@ pub fn check(
                                 ) {
                                     continue;
                                 }
-                                if !prop_names.contains(id) {
-                                    let in_ws = ws.map_or(false, |w| w.props.contains(id));
-                                    if !in_ws {
-                                        let byte_start = inner_start + id_start;
-                                        let byte_end = inner_start + k;
-                                        let range = byte_range_to_lsp(text, byte_start..byte_end);
-                                        diags.push(make_diag(
-                                            range,
-                                            undef_severity,
-                                            format!("Undefined xacro property '{}'", id),
-                                        ));
-                                    }
+                                if !prop_names.contains(id)
+                                    && !ws.is_some_and(|w| w.has_prop(id))
+                                {
+                                    let byte_start = inner_start + id_start;
+                                    let byte_end = inner_start + k;
+                                    let range = byte_range_to_lsp(text, byte_start..byte_end);
+                                    diags.push(make_diag(
+                                        range,
+                                        undef_severity,
+                                        format!("Undefined xacro property '{}'", id),
+                                    ));
                                 }
                             } else {
                                 k += 1;

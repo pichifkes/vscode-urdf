@@ -8,54 +8,10 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 mod document;
 mod diagnostics;
 mod features;
+mod workspace;
 mod xacro_eval;
 
-// ── Workspace index ──────────────────────────────────────────────────────────
-
-/// Entity names and definition locations known across the entire workspace.
-/// Populated from all open and scanned URDF/xacro files.
-#[derive(Debug, Default)]
-struct WorkspaceIndex {
-    // Fast membership sets (for diagnostic suppression)
-    link_names:  std::collections::HashSet<String>,
-    joint_names: std::collections::HashSet<String>,
-    prop_names:  std::collections::HashSet<String>,
-    // Definition locations (for cross-file goto-def and hover)
-    link_locations:  HashMap<String, (Url, Range)>,
-    joint_locations: HashMap<String, (Url, Range)>,
-    /// Per-file summary used to clean up stale entries on update.
-    per_file: HashMap<Url, FileSummary>,
-}
-
-/// Per-file entity list carrying both the name and its definition range.
-#[derive(Debug, Default)]
-struct FileSummary {
-    links:  Vec<(String, Range)>,
-    joints: Vec<(String, Range)>,
-    props:  Vec<(String, Range)>,
-}
-
-impl WorkspaceIndex {
-    fn upsert(&mut self, uri: Url, summary: FileSummary) {
-        if let Some(old) = self.per_file.remove(&uri) {
-            for (n, _) in old.links  { self.link_names.remove(&n); self.link_locations.remove(&n); }
-            for (n, _) in old.joints { self.joint_names.remove(&n); self.joint_locations.remove(&n); }
-            for (n, _) in old.props  { self.prop_names.remove(&n); }
-        }
-        for (n, r) in &summary.links {
-            self.link_names.insert(n.clone());
-            self.link_locations.insert(n.clone(), (uri.clone(), *r));
-        }
-        for (n, r) in &summary.joints {
-            self.joint_names.insert(n.clone());
-            self.joint_locations.insert(n.clone(), (uri.clone(), *r));
-        }
-        for (n, _) in &summary.props {
-            self.prop_names.insert(n.clone());
-        }
-        self.per_file.insert(uri, summary);
-    }
-}
+use workspace::{FileSummary, WorkspaceIndex};
 
 // ── Workspace file scanner ───────────────────────────────────────────────────
 
@@ -86,17 +42,9 @@ fn scan_workspace_sync(roots: Vec<std::path::PathBuf>) -> Vec<(Url, FileSummary)
             let text = std::fs::read_to_string(&path).ok()?;
             let (doc, _) = document::parse(&text);
             let uri = Url::from_file_path(&path).ok()?;
-            Some((uri, summary_from_doc(&doc)))
+            Some((uri, FileSummary::from_doc(&doc)))
         })
         .collect()
-}
-
-fn summary_from_doc(doc: &document::Document) -> FileSummary {
-    FileSummary {
-        links:  doc.links.iter().map(|l| (l.name.clone(), l.range)).collect(),
-        joints: doc.joints.iter().map(|j| (j.name.clone(), j.range)).collect(),
-        props:  doc.xacro_properties.iter().map(|p| (p.name.clone(), p.range)).collect(),
-    }
 }
 
 // ── LSP backend ──────────────────────────────────────────────────────────────
@@ -107,6 +55,11 @@ struct Backend {
     docs: Arc<Mutex<HashMap<Url, (document::Document, String)>>>,
     workspace_roots: Arc<Mutex<Vec<std::path::PathBuf>>>,
     workspace_index: Arc<tokio::sync::RwLock<WorkspaceIndex>>,
+    /// True iff the client advertised UTF-8 in `initialize` and we negotiated
+    /// it. When false, the LSP default of UTF-16 is in effect but the rest of
+    /// the codebase treats `Position.character` as a UTF-8 byte offset — see
+    /// the warning emitted from `initialized()`.
+    utf8_negotiated: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[tower_lsp::async_trait]
@@ -114,13 +67,19 @@ impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         // Prefer UTF-8 position encoding so `Position.character` is a byte offset
         // matching our internal UTF-8 text storage. Fall back to UTF-16 (the LSP
-        // default) if the client doesn't advertise UTF-8 support.
+        // default) if the client doesn't advertise UTF-8 support — but record
+        // the fact so `initialized()` can warn the user that non-ASCII files
+        // may resolve to wrong cursor positions (we don't convert UTF-16 → UTF-8).
         let position_encoding = params
             .capabilities
             .general
             .as_ref()
             .and_then(|g| g.position_encodings.as_ref())
             .and_then(|encs| encs.iter().find(|e| **e == PositionEncodingKind::UTF8).cloned());
+        self.utf8_negotiated.store(
+            position_encoding.is_some(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
 
         // Save workspace roots for the initial file scan in `initialized()`.
         {
@@ -176,6 +135,17 @@ impl LanguageServer for Backend {
             .log_message(MessageType::INFO, "urdf-lsp initialized")
             .await;
 
+        if !self.utf8_negotiated.load(std::sync::atomic::Ordering::SeqCst) {
+            self.client.log_message(
+                MessageType::WARNING,
+                "urdf-lsp: client did not advertise UTF-8 position encoding; \
+                 the server is using UTF-16 but treats Position.character as a \
+                 UTF-8 byte offset internally. Files containing non-ASCII \
+                 characters may produce wrong cursor positions for hover / \
+                 goto-definition. ASCII-only files are unaffected.",
+            ).await;
+        }
+
         let roots = self.workspace_roots.lock().await.clone();
         if roots.is_empty() {
             return;
@@ -193,9 +163,17 @@ impl LanguageServer for Backend {
                 scan_workspace_sync(roots)
             }).await else { return; };
 
-            {
+            // Chunk the upsert so the write lock yields back to interleaved
+            // `validate` calls (active editing) every N files — otherwise a
+            // cold-start scan of a huge workspace stalls every keystroke until
+            // the entire index is populated.
+            const UPSERT_CHUNK: usize = 32;
+            let mut iter = entries.into_iter();
+            loop {
+                let chunk: Vec<_> = iter.by_ref().take(UPSERT_CHUNK).collect();
+                if chunk.is_empty() { break; }
                 let mut idx = ws_idx.write().await;
-                for (uri, summary) in entries {
+                for (uri, summary) in chunk {
                     idx.upsert(uri, summary);
                 }
             }
@@ -210,15 +188,10 @@ impl LanguageServer for Backend {
             for (uri, text) in open {
                 let (doc, mut diags) = document::parse(&text);
                 if doc.parse_ok {
-                    let ws = {
+                    {
                         let idx = ws_idx.read().await;
-                        diagnostics::WorkspaceNames {
-                            links:  idx.link_names.clone(),
-                            joints: idx.joint_names.clone(),
-                            props:  idx.prop_names.clone(),
-                        }
-                    };
-                    diags.extend(diagnostics::check(&doc, &text, Some(&ws)));
+                        diags.extend(diagnostics::check(&doc, &text, Some(&idx)));
+                    }
                     if let Ok(ref xml) = roxmltree::Document::parse(&text) {
                         diags.extend(diagnostics::check_schema(xml, &text));
                     }
@@ -248,17 +221,10 @@ impl LanguageServer for Backend {
         let (result, ref_info) = {
             let map = self.docs.lock().await;
             match map.get(&uri) {
-                None => {
-                    self.client.log_message(MessageType::WARNING, format!("hover: doc not found for {uri}")).await;
-                    (None, None)
-                }
+                None => (None, None),
                 Some((doc, _)) => {
                     let h = features::hover(doc, pos);
                     let ri = if h.is_none() { features::entity_at(doc, pos) } else { None };
-                    self.client.log_message(MessageType::INFO, format!(
-                        "hover: pos={:?} same_file={} entity_at={:?}",
-                        pos, h.is_some(), ri.as_ref().map(|(n, _)| n.as_str())
-                    )).await;
                     (h, ri)
                 }
             }
@@ -268,15 +234,12 @@ impl LanguageServer for Backend {
         // Phase 2: cross-file — look up the referenced entity in the workspace index.
         if let Some((name, kind)) = ref_info {
             let idx = self.workspace_index.read().await;
-            let loc = match kind {
-                features::ItemKind::Link  => idx.link_locations.get(&name),
-                features::ItemKind::Joint => idx.joint_locations.get(&name),
+            let defs = match kind {
+                features::ItemKind::Link  => idx.link_defs(&name),
+                features::ItemKind::Joint => idx.joint_defs(&name),
             };
-            self.client.log_message(MessageType::INFO, format!(
-                "hover cross-file: name={name} found_in_index={}", loc.is_some()
-            )).await;
-            if let Some((def_uri, _)) = loc {
-                return Ok(Some(Self::cross_file_hover(&name, &kind, def_uri)));
+            if let Some(hover) = Self::cross_file_hover(&name, kind, defs) {
+                return Ok(Some(hover));
             }
         }
         Ok(None)
@@ -305,18 +268,20 @@ impl LanguageServer for Backend {
         };
         if result.is_some() { return Ok(result); }
 
-        // Phase 2: cross-file — navigate to the definition in another workspace file.
+        // Phase 2: cross-file — return every definition across the workspace.
+        // Multiple files defining the same name → Array response so the editor
+        // can present the user with a picker rather than guessing.
         if let Some((name, kind)) = ref_info {
             let idx = self.workspace_index.read().await;
-            let loc = match kind {
-                features::ItemKind::Link  => idx.link_locations.get(&name),
-                features::ItemKind::Joint => idx.joint_locations.get(&name),
+            let defs = match kind {
+                features::ItemKind::Link  => idx.link_defs(&name),
+                features::ItemKind::Joint => idx.joint_defs(&name),
             };
-            if let Some((def_uri, def_range)) = loc {
-                return Ok(Some(GotoDefinitionResponse::Scalar(Location {
-                    uri: def_uri.clone(),
-                    range: *def_range,
-                })));
+            if !defs.is_empty() {
+                let locs: Vec<Location> = defs.iter()
+                    .map(|(u, r)| Location { uri: u.clone(), range: *r })
+                    .collect();
+                return Ok(Some(GotoDefinitionResponse::Array(locs)));
             }
         }
         Ok(None)
@@ -425,46 +390,57 @@ impl LanguageServer for Backend {
 }
 
 impl Backend {
-    fn cross_file_hover(name: &str, kind: &features::ItemKind, def_uri: &Url) -> Hover {
-        let file = def_uri.path_segments()
-            .and_then(|mut s| s.next_back())
-            .unwrap_or("another file");
-        let label = match kind {
-            features::ItemKind::Link  => format!("**Link** `{name}` — defined in `{file}`"),
-            features::ItemKind::Joint => format!("**Joint** `{name}` — defined in `{file}`"),
+    /// Build a cross-file hover for an entity defined in one or more other
+    /// workspace files. Returns `None` if `defs` is empty.
+    ///
+    /// Multi-definition case: shows the first file and a `(+N more)` suffix —
+    /// the editor's goto-definition picker is how the user navigates between
+    /// them, so we don't try to list them all in the hover popup.
+    fn cross_file_hover(
+        name: &str,
+        kind: features::ItemKind,
+        defs: &[(Url, Range)],
+    ) -> Option<Hover> {
+        let ((def_uri, _), rest) = defs.split_first()?;
+        let file = file_name_for_display(def_uri);
+        let kind_word = match kind {
+            features::ItemKind::Link  => "Link",
+            features::ItemKind::Joint => "Joint",
         };
-        Hover {
+        let suffix = if rest.is_empty() {
+            String::new()
+        } else {
+            format!(" (+{} more)", rest.len())
+        };
+        let label = format!("**{kind_word}** `{name}` — defined in `{file}`{suffix}");
+        Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
                 value: label,
             }),
             range: None,
-        }
+        })
     }
 
     async fn validate(&self, uri: Url, text: String) {
         let (doc, mut diags) = document::parse(&text);
 
-        // Step 1: update workspace index with this file's entities.
+        // Build the summary BEFORE taking the write lock — `from_doc` clones
+        // every name string, and we don't want that work blocking other writers
+        // (or readers, since RwLock writers exclude readers).
+        let summary = FileSummary::from_doc(&doc);
         {
-            let summary = summary_from_doc(&doc);
             let mut idx = self.workspace_index.write().await;
             idx.upsert(uri.clone(), summary);
         }
 
-        // Step 2: snapshot workspace names (drop lock before running diagnostics).
-        let ws = {
-            let idx = self.workspace_index.read().await;
-            diagnostics::WorkspaceNames {
-                links:  idx.link_names.clone(),
-                joints: idx.joint_names.clone(),
-                props:  idx.prop_names.clone(),
-            }
-        };
-
-        // Step 3: run diagnostics with workspace context.
+        // Run diagnostics with the live workspace index held by read lock —
+        // no clones, no snapshot allocation per keystroke.
         if doc.parse_ok {
-            diags.extend(diagnostics::check(&doc, &text, Some(&ws)));
+            {
+                let idx = self.workspace_index.read().await;
+                diags.extend(diagnostics::check(&doc, &text, Some(&idx)));
+            }
             if let Ok(ref xml) = roxmltree::Document::parse(&text) {
                 diags.extend(diagnostics::check_schema(xml, &text));
             }
@@ -478,6 +454,123 @@ impl Backend {
     }
 }
 
+/// Final path segment of a file:// URL for display in hover tooltips.
+/// Falls back to the full URL as last resort — non-file URLs shouldn't reach
+/// the workspace index, but if they do we'd rather show *something* identifying
+/// than a generic "another file" placeholder.
+fn file_name_for_display(uri: &Url) -> String {
+    if let Ok(path) = uri.to_file_path() {
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            return name.to_string();
+        }
+    }
+    uri.path_segments()
+        .and_then(|mut s| s.next_back().filter(|seg| !seg.is_empty()))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| uri.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end test of the cross-file hover/goto-def composition WITHOUT
+    /// constructing a `Backend` (which needs a tower-lsp `Client`). The handlers
+    /// in `Backend::hover` / `Backend::goto_definition` are pure glue around
+    /// these four steps — if each step works individually and they wire up
+    /// here, the handlers are correct too.
+    #[test]
+    fn cross_file_hover_chain_resolves_to_other_file() {
+        // File A defines base_link; file B references it via <parent link="base_link"/>.
+        let text_a = "<robot name=\"a\">\n  <link name=\"base_link\"/>\n</robot>";
+        let text_b = "<robot name=\"b\">\n  <joint name=\"j\" type=\"fixed\">\n    <parent link=\"base_link\"/>\n    <child link=\"x\"/>\n  </joint>\n  <link name=\"x\"/>\n</robot>";
+
+        let (doc_a, _) = document::parse(text_a);
+        let (doc_b, _) = document::parse(text_b);
+        let uri_a = Url::parse("file:///a.urdf").unwrap();
+        let uri_b = Url::parse("file:///b.urdf").unwrap();
+
+        let mut idx = WorkspaceIndex::default();
+        idx.upsert(uri_a.clone(), FileSummary::from_doc(&doc_a));
+        idx.upsert(uri_b.clone(), FileSummary::from_doc(&doc_b));
+
+        // Step 1: same-file hover misses for the cross-file ref.
+        let pos = Position::new(2, 18); // mid-`base_link` in <parent link="base_link"/>
+        assert!(features::hover(&doc_b, pos).is_none(), "same-file hover must miss for cross-file ref");
+
+        // Step 2: entity_at surfaces the referenced name and kind.
+        let (name, kind) = features::entity_at(&doc_b, pos)
+            .expect("entity_at must return the ref name");
+        assert_eq!(name, "base_link");
+        assert_eq!(kind, features::ItemKind::Link);
+
+        // Step 3: workspace index resolves the name to file A.
+        let defs = idx.link_defs(&name);
+        assert_eq!(defs.len(), 1, "exactly one definition expected, got {defs:?}");
+        assert_eq!(defs[0].0, uri_a);
+
+        // Step 4: cross_file_hover builds the right tooltip.
+        let hover = Backend::cross_file_hover(&name, kind, defs).expect("hover should be Some");
+        match hover.contents {
+            HoverContents::Markup(m) => {
+                assert!(m.value.contains("**Link**"), "got: {}", m.value);
+                assert!(m.value.contains("base_link"), "got: {}", m.value);
+                assert!(m.value.contains("a.urdf"), "filename missing: {}", m.value);
+                assert!(!m.value.contains("more"), "should not show '+N more' for single def");
+            }
+            _ => panic!("expected Markup hover content"),
+        }
+    }
+
+    #[test]
+    fn cross_file_hover_shows_multi_def_suffix_when_collision() {
+        // Two files both define `base_link` — hover should mention "+1 more".
+        let text = "<robot name=\"r\">\n  <link name=\"base_link\"/>\n</robot>";
+        let (doc, _) = document::parse(text);
+        let uri_a = Url::parse("file:///a.urdf").unwrap();
+        let uri_b = Url::parse("file:///b.urdf").unwrap();
+        let mut idx = WorkspaceIndex::default();
+        idx.upsert(uri_a, FileSummary::from_doc(&doc));
+        idx.upsert(uri_b, FileSummary::from_doc(&doc));
+
+        let defs = idx.link_defs("base_link");
+        assert_eq!(defs.len(), 2);
+        let hover = Backend::cross_file_hover("base_link", features::ItemKind::Link, defs)
+            .expect("hover should be Some");
+        match hover.contents {
+            HoverContents::Markup(m) => {
+                assert!(m.value.contains("(+1 more)"),
+                    "expected multi-def suffix in: {}", m.value);
+            }
+            _ => panic!("expected Markup hover content"),
+        }
+    }
+
+    #[test]
+    fn cross_file_hover_returns_none_for_empty_defs() {
+        // Workspace doesn't know about this name — hover must return None,
+        // not panic on empty slice.
+        let hover = Backend::cross_file_hover("missing", features::ItemKind::Joint, &[]);
+        assert!(hover.is_none());
+    }
+
+    #[test]
+    fn prop_defs_accessor_returns_xacro_property_locations() {
+        // Symmetric coverage of `prop_defs` so cross-file xacro property
+        // resolution (future feature) has a tested foundation.
+        let text = "<robot xmlns:xacro=\"http://www.ros.org/wiki/xacro\" name=\"r\">\n  <xacro:property name=\"wheel_radius\" value=\"0.05\"/>\n</robot>";
+        let (doc, _) = document::parse(text);
+        let uri = Url::parse("file:///props.urdf").unwrap();
+        let mut idx = WorkspaceIndex::default();
+        idx.upsert(uri.clone(), FileSummary::from_doc(&doc));
+
+        let defs = idx.prop_defs("wheel_radius");
+        assert_eq!(defs.len(), 1, "expected one prop def, got {defs:?}");
+        assert_eq!(defs[0].0, uri);
+        assert!(idx.prop_defs("nonexistent").is_empty());
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let stdin = tokio::io::stdin();
@@ -487,6 +580,7 @@ async fn main() {
         docs: Arc::new(Mutex::new(HashMap::new())),
         workspace_roots: Arc::new(Mutex::new(Vec::new())),
         workspace_index: Arc::new(tokio::sync::RwLock::new(WorkspaceIndex::default())),
+        utf8_negotiated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }

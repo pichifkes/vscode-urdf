@@ -228,7 +228,7 @@ pub fn hover(doc: &Document, pos: Position) -> Option<Hover> {
 // name_at / range_and_name_at helpers + ItemKind
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ItemKind {
     Link,
     Joint,
@@ -924,6 +924,87 @@ mod tests {
         for t in crate::diagnostics::JOINT_TYPES {
             assert!(labels.contains(t), "expected joint type '{}' in completions, got: {:?}", t, labels);
         }
+    }
+
+    #[test]
+    fn entity_at_returns_link_name_on_parent_ref() {
+        // Cursor on `base_link` inside the `<parent link="..."/>` NameRef.
+        // `base_link` itself is NOT defined in this file (only `x` is), which is
+        // exactly the scenario where cross-file lookup matters — entity_at must
+        // still surface the referenced name regardless of local resolvability.
+        use tower_lsp::lsp_types::Position;
+        let text = "<robot name=\"r\">\n  <joint name=\"j\" type=\"fixed\">\n    <parent link=\"base_link\"/>\n    <child link=\"x\"/>\n  </joint>\n  <link name=\"x\"/>\n</robot>";
+        let (doc, _) = crate::document::parse(text);
+        // Find the column of `base_link` in line 2 (0-indexed).
+        let line = "    <parent link=\"base_link\"/>";
+        let col = line.find("base_link").unwrap() as u32 + 2; // mid-identifier
+        let result = super::entity_at(&doc, Position::new(2, col));
+        assert_eq!(
+            result,
+            Some(("base_link".to_string(), super::ItemKind::Link)),
+            "expected entity_at to return the cross-file link name, got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn entity_at_returns_link_name_on_child_ref() {
+        use tower_lsp::lsp_types::Position;
+        // Cursor on `link_b` inside `<child link="link_b"/>`.
+        let text = "<robot name=\"r\">\n  <joint name=\"j\" type=\"fixed\">\n    <parent link=\"a\"/>\n    <child link=\"link_b\"/>\n  </joint>\n  <link name=\"a\"/>\n</robot>";
+        let (doc, _) = crate::document::parse(text);
+        let line = "    <child link=\"link_b\"/>";
+        let col = line.find("link_b").unwrap() as u32 + 1;
+        let result = super::entity_at(&doc, Position::new(3, col));
+        assert_eq!(result, Some(("link_b".to_string(), super::ItemKind::Link)));
+    }
+
+    #[test]
+    fn entity_at_returns_joint_name_on_mimic_ref() {
+        use tower_lsp::lsp_types::Position;
+        // Cursor on `j1` inside `<mimic joint="j1"/>`. ItemKind must be Joint
+        // (mimic references joints, not links).
+        let text = "<robot name=\"r\">\n  <joint name=\"j2\" type=\"revolute\">\n    <parent link=\"a\"/>\n    <child link=\"b\"/>\n    <mimic joint=\"j1\"/>\n  </joint>\n  <link name=\"a\"/>\n  <link name=\"b\"/>\n</robot>";
+        let (doc, _) = crate::document::parse(text);
+        let line = "    <mimic joint=\"j1\"/>";
+        let col = line.find("j1").unwrap() as u32 + 1;
+        let result = super::entity_at(&doc, Position::new(4, col));
+        assert_eq!(result, Some(("j1".to_string(), super::ItemKind::Joint)));
+    }
+
+    #[test]
+    fn entity_at_returns_joint_name_on_joint_definition() {
+        use tower_lsp::lsp_types::Position;
+        // Cursor on `j` inside `<joint name="j" ...>`. ItemKind must be Joint.
+        let text = "<robot name=\"r\">\n  <joint name=\"j\" type=\"fixed\"><parent link=\"a\"/><child link=\"b\"/></joint>\n  <link name=\"a\"/>\n  <link name=\"b\"/>\n</robot>";
+        let (doc, _) = crate::document::parse(text);
+        let line = "  <joint name=\"j\" type=\"fixed\">";
+        // Find the position of the `j` value inside name="j" (after the quote).
+        let col = line.find("name=\"j").unwrap() as u32 + "name=\"".len() as u32;
+        let result = super::entity_at(&doc, Position::new(1, col));
+        assert_eq!(result, Some(("j".to_string(), super::ItemKind::Joint)));
+    }
+
+    #[test]
+    fn entity_at_returns_link_name_on_definition() {
+        // Cursor on `chassis` in `<link name="chassis"/>` — entity_at returns
+        // the defined name itself (used by rename / cross-file equivalents).
+        use tower_lsp::lsp_types::Position;
+        let text = "<robot name=\"r\">\n  <link name=\"chassis\"/>\n</robot>";
+        let (doc, _) = crate::document::parse(text);
+        let line = "  <link name=\"chassis\"/>";
+        let col = line.find("chassis").unwrap() as u32 + 1;
+        let result = super::entity_at(&doc, Position::new(1, col));
+        assert_eq!(result, Some(("chassis".to_string(), super::ItemKind::Link)));
+    }
+
+    #[test]
+    fn entity_at_returns_none_outside_any_range() {
+        use tower_lsp::lsp_types::Position;
+        let text = "<robot name=\"r\">\n  <link name=\"a\"/>\n</robot>";
+        let (doc, _) = crate::document::parse(text);
+        // Position on `<robot ` — not on any named entity range.
+        let result = super::entity_at(&doc, Position::new(0, 2));
+        assert!(result.is_none(), "expected None outside named ranges, got: {result:?}");
     }
 
     #[test]
