@@ -142,6 +142,45 @@ pub const JOINT_TYPES: &[&str] = &[
     "revolute", "continuous", "prismatic", "fixed", "floating", "planar",
 ];
 
+/// Per-joint-type human-readable docs surfaced in completion items —
+/// `(short_detail, markdown_documentation)`. Order matches [`JOINT_TYPES`].
+///
+/// **Consumer:** `features::completion()` attaches `detail` + `documentation`
+/// to each joint-type item so users see what they're picking. The text is
+/// distilled from the URDF spec (https://wiki.ros.org/urdf/XML/joint).
+pub const JOINT_TYPE_DOCS: &[(&str, &str, &str)] = &[
+    (
+        "revolute",
+        "rotates around an axis, with limits",
+        "**revolute** — A hinge that rotates around `<axis>` between `<limit lower>` and `<limit upper>`.\n\nRequires `<limit>` with `lower`, `upper`, `effort`, `velocity`.",
+    ),
+    (
+        "continuous",
+        "rotates around an axis, no limits",
+        "**continuous** — A hinge that rotates around `<axis>` with no angular bounds (e.g. a wheel).\n\nNo `<limit>` required; `effort`/`velocity` may still be set.",
+    ),
+    (
+        "prismatic",
+        "slides along an axis, with limits",
+        "**prismatic** — A linear (sliding) joint along `<axis>` between `<limit lower>` and `<limit upper>`.\n\nRequires `<limit>` with `lower`, `upper`, `effort`, `velocity`.",
+    ),
+    (
+        "fixed",
+        "rigid attachment, no motion",
+        "**fixed** — Not really a joint: all 6 DoF are locked. Use to rigidly weld two links together.\n\nNo `<axis>` or `<limit>` needed.",
+    ),
+    (
+        "floating",
+        "free 6-DoF motion",
+        "**floating** — Allows motion in all 6 degrees of freedom (3 translations + 3 rotations).\n\nRarely used; most physics engines treat this as a free body.",
+    ),
+    (
+        "planar",
+        "2-DoF motion in a plane",
+        "**planar** — Allows motion in the plane perpendicular to `<axis>`. 2 translational DoF, no rotation about the axis.",
+    ),
+];
+
 /// Run semantic checks on a parsed document.
 ///
 /// `ws` is the cross-workspace entity index (populated from all open and scanned
@@ -246,12 +285,32 @@ pub fn check(
         }
     }
 
-    // 6. Kinematic tree: multiple roots, disconnected links, cycles
+    // 6. Kinematic tree: multiple roots, disconnected links, cycles.
+    // `ws` lets us suppress "isolated"/"disconnected" diagnostics for links
+    // wired up by a joint living in another file.
     if doc.links.len() > 1 {
-        kinematic_tree_check(&doc, &mut diags, undef_severity);
+        kinematic_tree_check(&doc, &mut diags, undef_severity, ws);
     }
 
-    // 7. Gazebo reference must point to a known link or joint
+    // 7. Xacro macro calls must resolve to a `<xacro:macro name="X">`
+    // somewhere in the workspace.
+    {
+        let macro_names: std::collections::HashSet<&str> =
+            doc.xacro_macros.iter().map(|m| m.name.as_str()).collect();
+        for mref in &doc.xacro_macro_calls {
+            if !macro_names.contains(mref.name.as_str())
+                && !ws.is_some_and(|w| w.has_macro(&mref.name))
+            {
+                diags.push(make_diag(
+                    mref.range,
+                    undef_severity,
+                    format!("Undefined xacro macro '{}'", mref.name),
+                ));
+            }
+        }
+    }
+
+    // 8. Gazebo reference must point to a known link or joint
     for gref in &doc.gazebo_refs {
         let in_file = link_names.contains(gref.name.as_str()) || joint_names.contains(gref.name.as_str());
         let in_ws   = ws.is_some_and(|w| w.has_link(&gref.name) || w.has_joint(&gref.name));
@@ -363,6 +422,7 @@ fn kinematic_tree_check(
     doc: &Document,
     diags: &mut Vec<Diagnostic>,
     severity: DiagnosticSeverity,
+    ws: Option<&WorkspaceIndex>,
 ) {
     // Build parent→children adjacency and the set of all child link names.
     let mut adj: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
@@ -374,9 +434,11 @@ fn kinematic_tree_check(
         }
     }
 
-    // Isolated links: no parent joint AND no child joints — not part of any joint at all.
+    // Isolated links: no parent joint AND no child joints in *this file*.
+    // Suppress when the workspace shows the link is wired up elsewhere.
     for link in doc.links.iter()
         .filter(|l| !child_set.contains(l.name.as_str()) && !adj.contains_key(l.name.as_str()))
+        .filter(|l| !ws.is_some_and(|w| w.link_touched_by_joint(&l.name)))
     {
         diags.push(make_diag(
             link.range,
@@ -459,15 +521,20 @@ fn kinematic_tree_check(
         }
     }
 
-    // Links not reachable from any root are disconnected.
+    // Links not reachable from any root are disconnected — unless a joint in
+    // another file wires this link into a larger tree we can't see locally.
     for link in &doc.links {
-        if !visited.contains(link.name.as_str()) {
-            diags.push(make_diag(
-                link.range,
-                severity,
-                format!("Link '{}' is not connected to the kinematic tree", link.name),
-            ));
+        if visited.contains(link.name.as_str()) {
+            continue;
         }
+        if ws.is_some_and(|w| w.link_touched_by_joint(&link.name)) {
+            continue;
+        }
+        diags.push(make_diag(
+            link.range,
+            severity,
+            format!("Link '{}' is not connected to the kinematic tree", link.name),
+        ));
     }
 }
 
@@ -475,7 +542,12 @@ fn kinematic_tree_check(
 // Schema validation: unknown element names and unknown attributes
 // ---------------------------------------------------------------------------
 
-pub fn check_schema(xml: &roxmltree::Document, text: &str) -> Vec<Diagnostic> {
+pub fn check_schema(
+    xml: &roxmltree::Document,
+    text: &str,
+    is_xacro: bool,
+    ws: Option<&WorkspaceIndex>,
+) -> Vec<Diagnostic> {
     let mut props: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for node in xml.root_element().children() {
         if node.is_element() {
@@ -488,9 +560,67 @@ pub fn check_schema(xml: &roxmltree::Document, text: &str) -> Vec<Diagnostic> {
         }
     }
 
+    let soft_severity = if is_xacro {
+        DiagnosticSeverity::WARNING
+    } else {
+        DiagnosticSeverity::ERROR
+    };
+
     let mut diags = vec![];
-    walk_schema(xml.root_element(), text, &mut diags, false, &props);
+    let mut defined_materials: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut material_refs: Vec<(roxmltree::Node, String)> = Vec::new();
+    collect_materials(xml.root_element(), &mut defined_materials, &mut material_refs);
+    for (node, name) in material_refs {
+        if !defined_materials.contains(name.as_str())
+            && !ws.is_some_and(|w| w.has_material(&name))
+        {
+            let range = attr_value_range_for(text, &node, "name");
+            diags.push(make_diag(
+                range,
+                soft_severity,
+                format!("Undefined material '{name}'"),
+            ));
+        }
+    }
+
+    walk_schema(xml.root_element(), text, &mut diags, false, &props, soft_severity);
     diags
+}
+
+/// Walk the tree gathering material definitions (any `<material name="X">`
+/// containing a `<color>` or `<texture>` child) and reference-only uses
+/// (`<material name="X"/>` with no such child). Mirrors urdf_parser's two-pass
+/// resolution: a reference inside `<visual>` resolves against any inline or
+/// top-level definition anywhere in the document, regardless of order.
+fn collect_materials<'a>(
+    node: roxmltree::Node<'a, 'a>,
+    defined: &mut std::collections::HashSet<&'a str>,
+    refs: &mut Vec<(roxmltree::Node<'a, 'a>, String)>,
+) {
+    if !node.is_element() {
+        return;
+    }
+    if node.tag_name().name() == "material" && !is_xacro_element(&node) {
+        if let Some(name) = node.attribute("name") {
+            let has_def_child = node.children().any(|c| {
+                c.is_element()
+                    && matches!(c.tag_name().name(), "color" | "texture")
+                    && !is_xacro_element(&c)
+            });
+            if has_def_child {
+                defined.insert(name);
+            } else {
+                refs.push((node, name.to_string()));
+            }
+        }
+    }
+    for child in node.children() {
+        collect_materials(child, defined, refs);
+    }
+}
+
+fn attr_value_range_for(text: &str, node: &roxmltree::Node, attr_name: &str) -> Range {
+    crate::document::attr_value_range(text, node, attr_name)
 }
 
 fn walk_schema(
@@ -499,6 +629,7 @@ fn walk_schema(
     diags: &mut Vec<Diagnostic>,
     skip: bool,
     props: &std::collections::HashMap<&str, &str>,
+    soft_severity: DiagnosticSeverity,
 ) {
     if node.is_text() {
         if !skip {
@@ -561,6 +692,33 @@ fn walk_schema(
                         diags.push(make_diag(range, DiagnosticSeverity::ERROR, msg));
                     }
                 }
+
+                // Revolute and prismatic joints require a <limit> child;
+                // urdf_parser refuses to load the model otherwise.
+                if tag == "joint" {
+                    if let Some(t) = node.attribute("type") {
+                        if let Some(effective) = resolve_effective(t, props) {
+                            let kind = effective.trim();
+                            if matches!(kind, "revolute" | "prismatic") {
+                                let has_limit = node.children().any(|c| {
+                                    c.is_element()
+                                        && c.tag_name().name() == "limit"
+                                        && !is_xacro_element(&c)
+                                });
+                                if !has_limit {
+                                    let range = elem_name_range(text, &node);
+                                    diags.push(make_diag(
+                                        range,
+                                        soft_severity,
+                                        format!(
+                                            "Joint of type '{kind}' is missing required <limit> element"
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
             }
             None => {
                 let range = elem_name_range(text, &node);
@@ -579,7 +737,7 @@ fn walk_schema(
         }
     } else {
         for child in node.children() {
-            walk_schema(child, text, diags, child_skip, props);
+            walk_schema(child, text, diags, child_skip, props, soft_severity);
         }
     }
 }
@@ -1109,7 +1267,7 @@ mod tests {
           <link name="a" foo="bar"/>
         </robot>"#;
         let xml = roxmltree::Document::parse(text).unwrap();
-        let diags = check_schema(&xml, text);
+        let diags = check_schema(&xml, text, false, None);
         assert!(
             diags.iter().any(|d| d.message.contains("Unknown attribute 'foo'") && d.message.contains("<link>")),
             "expected unknown-attribute diagnostic on <link>, got: {:?}",
@@ -1125,7 +1283,7 @@ mod tests {
           <weeble/>
         </robot>"#;
         let xml = roxmltree::Document::parse(text).unwrap();
-        let diags = check_schema(&xml, text);
+        let diags = check_schema(&xml, text, false, None);
         assert!(
             diags.iter().any(|d| d.message.contains("Unknown URDF element") && d.message.contains("<weeble>")),
             "expected unknown-element diagnostic on <weeble>, got: {:?}",
@@ -1143,7 +1301,7 @@ mod tests {
           </joint>
         </robot>"#;
         let xml = roxmltree::Document::parse(text).unwrap();
-        let diags = check_schema(&xml, text);
+        let diags = check_schema(&xml, text, false, None);
         assert!(
             diags.iter().any(|d| d.message.contains("<mimic>") && d.message.contains("'joint'")),
             "expected missing-required-attr diagnostic on <mimic>, got: {:?}",
@@ -1159,7 +1317,7 @@ mod tests {
           <link name="a"><visual><geometry><box/></geometry></visual></link>
         </robot>"#;
         let xml = roxmltree::Document::parse(text).unwrap();
-        let diags = check_schema(&xml, text);
+        let diags = check_schema(&xml, text, false, None);
         assert!(
             diags.iter().any(|d| d.message.contains("<box>") && d.message.contains("'size'")),
             "expected missing-size diagnostic, got: {:?}",
@@ -1175,7 +1333,7 @@ mod tests {
           <link name="a"><visual><geometry><sphere radius="0.1" length="0.2"/></geometry></visual></link>
         </robot>"#;
         let xml = roxmltree::Document::parse(text).unwrap();
-        let diags = check_schema(&xml, text);
+        let diags = check_schema(&xml, text, false, None);
         assert!(
             diags.iter().any(|d| d.message.contains("Unknown attribute 'length'") && d.message.contains("<sphere>")),
             "expected unknown-attribute diagnostic on sphere, got: {:?}",
@@ -1195,7 +1353,7 @@ mod tests {
         </robot>"#;
         let (_, mut diags) = document::parse(text);
         let xml = roxmltree::Document::parse(text).unwrap();
-        diags.extend(check_schema(&xml, text));
+        diags.extend(check_schema(&xml, text, false, None));
         assert!(
             diags.iter().any(|d| d.message.contains("'type' must be one of") && d.message.contains("rotational")),
             "expected joint-type validator to flag 'rotational', got: {:?}",
@@ -1213,12 +1371,353 @@ mod tests {
           </joint>
         </robot>"#;
         let xml = roxmltree::Document::parse(text).unwrap();
-        let diags = check_schema(&xml, text);
+        let diags = check_schema(&xml, text, false, None);
         assert!(
             !diags.iter().any(|d| d.message.contains("'type' must be one of")),
             "valid joint type should not be flagged, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn revolute_joint_missing_limit_is_flagged() {
+        // urdf_parser refuses to load a revolute joint without <limit>;
+        // the LSP should catch this before runtime.
+        let text = r#"<?xml version="1.0"?><robot name="r">
+          <link name="a"/>
+          <link name="b"/>
+          <joint name="j" type="revolute">
+            <parent link="a"/><child link="b"/>
+            <axis xyz="0 0 1"/>
+          </joint>
+        </robot>"#;
+        let xml = roxmltree::Document::parse(text).unwrap();
+        let diags = check_schema(&xml, text, false, None);
+        assert!(
+            diags.iter().any(|d| d.message.contains("revolute") && d.message.contains("<limit>")),
+            "expected missing-limit diagnostic on revolute joint, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn prismatic_joint_missing_limit_is_flagged() {
+        let text = r#"<?xml version="1.0"?><robot name="r">
+          <link name="a"/>
+          <link name="b"/>
+          <joint name="j" type="prismatic">
+            <parent link="a"/><child link="b"/>
+            <axis xyz="0 0 1"/>
+          </joint>
+        </robot>"#;
+        let xml = roxmltree::Document::parse(text).unwrap();
+        let diags = check_schema(&xml, text, false, None);
+        assert!(
+            diags.iter().any(|d| d.message.contains("prismatic") && d.message.contains("<limit>")),
+            "expected missing-limit diagnostic on prismatic joint, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn revolute_joint_with_limit_passes() {
+        let text = r#"<?xml version="1.0"?><robot name="r">
+          <link name="a"/>
+          <link name="b"/>
+          <joint name="j" type="revolute">
+            <parent link="a"/><child link="b"/>
+            <axis xyz="0 0 1"/>
+            <limit lower="-1" upper="1" effort="10" velocity="1"/>
+          </joint>
+        </robot>"#;
+        let xml = roxmltree::Document::parse(text).unwrap();
+        let diags = check_schema(&xml, text, false, None);
+        assert!(
+            !diags.iter().any(|d| d.message.contains("<limit>")),
+            "revolute with <limit> must not be flagged, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn continuous_joint_does_not_require_limit() {
+        // Only revolute and prismatic need a limit; continuous/fixed/floating do not.
+        let text = r#"<?xml version="1.0"?><robot name="r">
+          <link name="a"/>
+          <link name="b"/>
+          <joint name="j" type="continuous">
+            <parent link="a"/><child link="b"/>
+            <axis xyz="0 0 1"/>
+          </joint>
+        </robot>"#;
+        let xml = roxmltree::Document::parse(text).unwrap();
+        let diags = check_schema(&xml, text, false, None);
+        assert!(
+            !diags.iter().any(|d| d.message.contains("<limit>")),
+            "continuous joint should not require <limit>, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn undefined_material_reference_is_flagged() {
+        // <material name="blue"/> inside <visual> without a top-level or
+        // inline definition of "blue" should be flagged — urdf_parser warns
+        // "material 'blue' undefined" at runtime.
+        let text = r#"<?xml version="1.0"?><robot name="r">
+          <link name="chassis">
+            <visual>
+              <geometry><box size="1 1 1"/></geometry>
+              <material name="blue"/>
+            </visual>
+          </link>
+        </robot>"#;
+        let xml = roxmltree::Document::parse(text).unwrap();
+        let diags = check_schema(&xml, text, false, None);
+        assert!(
+            diags.iter().any(|d| d.message.contains("Undefined material 'blue'")),
+            "expected undefined-material diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn material_reference_resolved_by_top_level_definition() {
+        let text = r#"<?xml version="1.0"?><robot name="r">
+          <material name="blue"><color rgba="0 0 1 1"/></material>
+          <link name="chassis">
+            <visual>
+              <geometry><box size="1 1 1"/></geometry>
+              <material name="blue"/>
+            </visual>
+          </link>
+        </robot>"#;
+        let xml = roxmltree::Document::parse(text).unwrap();
+        let diags = check_schema(&xml, text, false, None);
+        assert!(
+            !diags.iter().any(|d| d.message.contains("Undefined material")),
+            "top-level definition should satisfy the reference, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn material_reference_resolved_by_inline_definition_elsewhere() {
+        // urdf_parser treats any inline `<material name="X"><color/></material>`
+        // as a global definition by name; a bare ref in another link should
+        // resolve to it regardless of document order.
+        let text = r#"<?xml version="1.0"?><robot name="r">
+          <link name="a">
+            <visual>
+              <geometry><box size="1 1 1"/></geometry>
+              <material name="blue"/>
+            </visual>
+          </link>
+          <link name="b">
+            <visual>
+              <geometry><box size="1 1 1"/></geometry>
+              <material name="blue"><color rgba="0 0 1 1"/></material>
+            </visual>
+          </link>
+        </robot>"#;
+        let xml = roxmltree::Document::parse(text).unwrap();
+        let diags = check_schema(&xml, text, false, None);
+        assert!(
+            !diags.iter().any(|d| d.message.contains("Undefined material")),
+            "inline definition elsewhere should satisfy the reference, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn material_reference_resolved_by_workspace_index() {
+        // The current file only references "blue"; the definition lives in
+        // another file that has been indexed in the workspace. The reference
+        // must NOT be flagged.
+        use crate::workspace::{FileSummary, WorkspaceIndex};
+        use tower_lsp::lsp_types::{Position, Range, Url};
+
+        let mut ws = WorkspaceIndex::default();
+        ws.upsert(
+            Url::parse("file:///materials.urdf.xacro").unwrap(),
+            FileSummary {
+                materials: vec![(
+                    "blue".into(),
+                    Range::new(Position::new(0, 0), Position::new(0, 1)),
+                )],
+                ..Default::default()
+            },
+        );
+
+        let text = r#"<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <link name="chassis">
+    <visual>
+      <geometry><box size="1 1 1"/></geometry>
+      <material name="blue"/>
+    </visual>
+  </link>
+</robot>"#;
+        let xml = roxmltree::Document::parse(text).unwrap();
+        let diags = check_schema(&xml, text, true, Some(&ws));
+        assert!(
+            !diags.iter().any(|d| d.message.contains("Undefined material")),
+            "workspace-indexed material should satisfy the reference, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn xacro_softens_material_and_limit_diagnostics() {
+        // In xacro fragments, definitions may come from xacro:include or macros;
+        // missing material / missing limit should be Warning, not Error.
+        let text = r#"<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="r">
+  <link name="a"/>
+  <link name="b"/>
+  <link name="c">
+    <visual>
+      <geometry><box size="1 1 1"/></geometry>
+      <material name="blue"/>
+    </visual>
+  </link>
+  <joint name="j" type="revolute">
+    <parent link="a"/><child link="b"/>
+    <axis xyz="0 0 1"/>
+  </joint>
+</robot>"#;
+        let xml = roxmltree::Document::parse(text).unwrap();
+        let diags = check_schema(&xml, text, true, None);
+        let material_diag = diags.iter().find(|d| d.message.contains("Undefined material"));
+        let limit_diag = diags.iter().find(|d| d.message.contains("<limit>"));
+        assert!(material_diag.is_some(), "expected material diagnostic in xacro mode");
+        assert!(limit_diag.is_some(), "expected limit diagnostic in xacro mode");
+        assert_eq!(material_diag.unwrap().severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(limit_diag.unwrap().severity, Some(DiagnosticSeverity::WARNING));
+    }
+
+    #[test]
+    fn xacro_macro_call_with_definition_passes() {
+        // Macro defined in the same file → no diagnostic.
+        let text = r#"<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="r">
+  <xacro:macro name="wheel" params="prefix">
+    <link name="${prefix}_wheel"/>
+  </xacro:macro>
+  <xacro:wheel prefix="left"/>
+</robot>"#;
+        let (doc, mut diags) = document::parse(text);
+        diags.extend(check(&doc, text, None));
+        assert!(
+            !diags.iter().any(|d| d.message.contains("Undefined xacro macro")),
+            "defined macro must not be flagged, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn undefined_xacro_macro_call_is_flagged() {
+        let text = r#"<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="r">
+  <xacro:fenagle prefix="left"/>
+</robot>"#;
+        let (doc, mut diags) = document::parse(text);
+        diags.extend(check(&doc, text, None));
+        assert!(
+            diags.iter().any(|d| d.message.contains("Undefined xacro macro 'fenagle'")),
+            "expected undefined-macro diagnostic, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn xacro_macro_call_resolved_by_workspace_index() {
+        use crate::workspace::{FileSummary, WorkspaceIndex};
+        use tower_lsp::lsp_types::{Position, Range, Url};
+
+        let mut ws = WorkspaceIndex::default();
+        ws.upsert(
+            Url::parse("file:///macros.urdf.xacro").unwrap(),
+            FileSummary {
+                macros: vec![(
+                    "wheel".into(),
+                    Range::new(Position::new(0, 0), Position::new(0, 1)),
+                )],
+                ..Default::default()
+            },
+        );
+        let text = r#"<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="r">
+  <xacro:wheel prefix="left"/>
+</robot>"#;
+        let (doc, mut diags) = document::parse(text);
+        diags.extend(check(&doc, text, Some(&ws)));
+        assert!(
+            !diags.iter().any(|d| d.message.contains("Undefined xacro macro")),
+            "workspace-indexed macro should satisfy the call, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn xacro_builtins_are_not_treated_as_macro_calls() {
+        // <xacro:if>, <xacro:include>, etc. are part of the xacro language,
+        // not macro invocations — they must never produce "Undefined macro".
+        let text = r#"<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="r">
+  <xacro:include filename="other.urdf.xacro"/>
+  <xacro:property name="foo" value="1"/>
+  <xacro:if value="true">
+    <link name="cond"/>
+  </xacro:if>
+  <xacro:unless value="false">
+    <link name="cond2"/>
+  </xacro:unless>
+</robot>"#;
+        let (doc, mut diags) = document::parse(text);
+        diags.extend(check(&doc, text, None));
+        let undef: Vec<_> = diags.iter().filter(|d| d.message.contains("Undefined xacro macro")).collect();
+        assert!(undef.is_empty(),
+            "built-in xacro tags must not be flagged as macro calls, got: {:?}",
+            undef.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn isolated_link_suppressed_by_cross_file_joint() {
+        // File-local view: link "lonely" has no joints in this file → would
+        // be flagged as isolated. But the workspace says some joint somewhere
+        // connects "lonely" — suppress.
+        use crate::workspace::{FileSummary, WorkspaceIndex};
+        use tower_lsp::lsp_types::{Position, Range, Url};
+
+        let mut ws = WorkspaceIndex::default();
+        ws.upsert(
+            Url::parse("file:///elsewhere.urdf.xacro").unwrap(),
+            FileSummary {
+                linked_by_joint: vec![(
+                    "lonely".into(),
+                    Range::new(Position::new(0, 0), Position::new(0, 1)),
+                )],
+                ..Default::default()
+            },
+        );
+        let text = r#"<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="r">
+  <link name="lonely"/>
+  <link name="other"/>
+  <joint name="j" type="fixed">
+    <parent link="other"/><child link="extra"/>
+  </joint>
+  <link name="extra"/>
+</robot>"#;
+        let (doc, mut diags) = document::parse(text);
+        diags.extend(check(&doc, text, Some(&ws)));
+        let lonely_diags: Vec<_> = diags.iter()
+            .filter(|d| d.message.contains("lonely") && (d.message.contains("no joints") || d.message.contains("not connected")))
+            .collect();
+        assert!(lonely_diags.is_empty(),
+            "cross-file joint should suppress isolated-link diagnostic, got: {:?}",
+            lonely_diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
 
     #[test]

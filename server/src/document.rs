@@ -63,6 +63,11 @@ pub struct Document {
     pub xacro_properties: Vec<XacroProperty>,
     /// `reference` attribute values from `<gazebo reference="...">` elements.
     pub gazebo_refs: Vec<NameRef>,
+    /// `<xacro:macro name="X">` definitions found anywhere in the tree.
+    pub xacro_macros: Vec<NamedItem>,
+    /// Call sites — every `<xacro:X .../>` whose local name isn't a built-in
+    /// xacro element (macro / property / include / if / unless / arg / …).
+    pub xacro_macro_calls: Vec<NameRef>,
     /// True when the root element declares xmlns:xacro — indicates a xacro fragment
     /// where some links/joints may be defined in included files.
     pub is_xacro: bool,
@@ -70,6 +75,14 @@ pub struct Document {
     /// must skip work, otherwise empty symbol tables flag everything as undefined.
     pub parse_ok: bool,
 }
+
+/// Element names under the `xacro:` namespace that are part of the xacro
+/// language itself, not user-defined macro invocations. A `<xacro:foo>` whose
+/// local name isn't in this list is treated as a call to a macro named `foo`.
+pub(crate) const XACRO_BUILTINS: &[&str] = &[
+    "macro", "property", "include", "if", "unless", "arg",
+    "insert_block", "element", "attribute", "call",
+];
 
 #[derive(Debug, Clone)]
 pub struct XacroProperty {
@@ -107,6 +120,8 @@ pub fn parse(text: &str) -> (Document, Vec<Diagnostic>) {
         materials: Vec::new(),
         xacro_properties: Vec::new(),
         gazebo_refs: Vec::new(),
+        xacro_macros: Vec::new(),
+        xacro_macro_calls: Vec::new(),
         is_xacro: false,
         parse_ok: true,
     };
@@ -255,7 +270,79 @@ pub fn parse(text: &str) -> (Document, Vec<Diagnostic>) {
         }
     }
 
+    // Macros (defs + calls) can be nested anywhere — macros call macros, calls
+    // appear inside <link>/<joint>/<inertial>/etc. Walk the whole tree.
+    collect_xacro_macros(root, text, &mut doc);
+
     (doc, vec![])
+}
+
+fn collect_xacro_macros(node: roxmltree::Node, text: &str, doc: &mut Document) {
+    if !node.is_element() {
+        return;
+    }
+    let local = xacro_local_name(&node);
+    if let Some(local) = local {
+        match local {
+            "macro" => {
+                if let Some(name) = node.attribute("name") {
+                    let range = attr_value_range(text, &node, "name");
+                    doc.xacro_macros.push(NamedItem {
+                        name: name.to_string(),
+                        range,
+                    });
+                }
+            }
+            // Calls are anything under `xacro:` that isn't a built-in.
+            other if !XACRO_BUILTINS.contains(&other) => {
+                let range = elem_name_range(text, &node);
+                doc.xacro_macro_calls.push(NameRef {
+                    name: other.to_string(),
+                    range,
+                });
+            }
+            _ => {}
+        }
+    }
+    for child in node.children() {
+        collect_xacro_macros(child, text, doc);
+    }
+}
+
+/// Return the local name iff `node` is in the xacro namespace (either via
+/// `xmlns:xacro=...` or via the `xacro:` prefix syntax).
+fn xacro_local_name<'a>(node: &roxmltree::Node<'a, 'a>) -> Option<&'a str> {
+    let tag = node.tag_name();
+    if tag.namespace().map_or(false, |n| n.contains("xacro")) {
+        return Some(tag.name());
+    }
+    // Fall back: roxmltree without a declared namespace keeps the prefix.
+    // Strictly speaking a well-formed xacro file declares xmlns:xacro, but
+    // be lenient.
+    let raw = tag.name();
+    raw.strip_prefix("xacro:")
+}
+
+fn elem_name_range(text: &str, node: &roxmltree::Node) -> Range {
+    // Skip the leading '<' and any namespace prefix so the range points at the
+    // local name the user types as the macro identifier.
+    let start = node.range().start + 1;
+    let name = node.tag_name().name();
+    let bytes = text.as_bytes();
+    // Walk past the prefix if present (`xacro:foo` → start at `foo`).
+    let mut name_start = start;
+    while name_start < bytes.len() && bytes[name_start] != b':'
+        && (bytes[name_start] as char).is_ascii_graphic() && bytes[name_start] != b' '
+        && bytes[name_start] != b'>' && bytes[name_start] != b'/'
+    {
+        name_start += 1;
+    }
+    if name_start < bytes.len() && bytes[name_start] == b':' {
+        name_start += 1;
+    } else {
+        name_start = start;
+    }
+    byte_range_to_lsp(text, name_start..name_start + name.len())
 }
 
 /// Walk the document tracking opening/closing tag balance. Returns a single

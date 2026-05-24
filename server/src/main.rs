@@ -188,12 +188,10 @@ impl LanguageServer for Backend {
             for (uri, text) in open {
                 let (doc, mut diags) = document::parse(&text);
                 if doc.parse_ok {
-                    {
-                        let idx = ws_idx.read().await;
-                        diags.extend(diagnostics::check(&doc, &text, Some(&idx)));
-                    }
+                    let idx = ws_idx.read().await;
+                    diags.extend(diagnostics::check(&doc, &text, Some(&idx)));
                     if let Ok(ref xml) = roxmltree::Document::parse(&text) {
-                        diags.extend(diagnostics::check_schema(xml, &text));
+                        diags.extend(diagnostics::check_schema(xml, &text, doc.is_xacro, Some(&idx)));
                     }
                 }
                 client.publish_diagnostics(uri, diags, None).await;
@@ -437,12 +435,10 @@ impl Backend {
         // Run diagnostics with the live workspace index held by read lock —
         // no clones, no snapshot allocation per keystroke.
         if doc.parse_ok {
-            {
-                let idx = self.workspace_index.read().await;
-                diags.extend(diagnostics::check(&doc, &text, Some(&idx)));
-            }
+            let idx = self.workspace_index.read().await;
+            diags.extend(diagnostics::check(&doc, &text, Some(&idx)));
             if let Ok(ref xml) = roxmltree::Document::parse(&text) {
-                diags.extend(diagnostics::check_schema(xml, &text));
+                diags.extend(diagnostics::check_schema(xml, &text, doc.is_xacro, Some(&idx)));
             }
         }
 

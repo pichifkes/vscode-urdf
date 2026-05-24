@@ -395,14 +395,20 @@ pub fn completion(doc: &Document, pos: Position, text: &str) -> Vec<CompletionIt
     let line_start = text[..cursor_offset].rfind('\n').map(|p| p + 1).unwrap_or(0);
     let prefix = &text[line_start..cursor_offset];
 
-    // Enum completions: type= inside <joint …> → offer all valid joint types.
+    // Enum completions: type= inside <joint …> → offer all valid joint types,
+    // with per-type docs surfaced so the user can pick informed.
     if find_attr_open(prefix, "type") {
         if current_tag_name(text, cursor_offset).as_deref() == Some("joint") {
-            return crate::diagnostics::JOINT_TYPES
+            return crate::diagnostics::JOINT_TYPE_DOCS
                 .iter()
-                .map(|&t| CompletionItem {
-                    label: t.to_string(),
+                .map(|(name, detail, doc)| CompletionItem {
+                    label: name.to_string(),
                     kind: Some(CompletionItemKind::ENUM_MEMBER),
+                    detail: Some(detail.to_string()),
+                    documentation: Some(Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: doc.to_string(),
+                    })),
                     ..CompletionItem::default()
                 })
                 .collect();
@@ -924,6 +930,35 @@ mod tests {
         for t in crate::diagnostics::JOINT_TYPES {
             assert!(labels.contains(t), "expected joint type '{}' in completions, got: {:?}", t, labels);
         }
+        // Every completion item should carry a detail line and markdown documentation
+        // so the user sees what each type does as they pick.
+        for item in &items {
+            assert!(item.detail.is_some(), "joint-type item '{}' missing detail", item.label);
+            assert!(
+                matches!(item.documentation, Some(tower_lsp::lsp_types::Documentation::MarkupContent(_))),
+                "joint-type item '{}' missing markdown documentation",
+                item.label,
+            );
+        }
+    }
+
+    #[test]
+    fn joint_type_docs_cover_every_joint_type() {
+        // The docs table must stay in sync with JOINT_TYPES — otherwise the
+        // completion silently drops types that exist in the validator.
+        let doc_names: Vec<&str> = crate::diagnostics::JOINT_TYPE_DOCS
+            .iter()
+            .map(|(n, _, _)| *n)
+            .collect();
+        for t in crate::diagnostics::JOINT_TYPES {
+            assert!(doc_names.contains(t), "JOINT_TYPE_DOCS is missing '{}'", t);
+        }
+        assert_eq!(
+            doc_names.len(),
+            crate::diagnostics::JOINT_TYPES.len(),
+            "JOINT_TYPE_DOCS has entries not in JOINT_TYPES: {:?}",
+            doc_names,
+        );
     }
 
     #[test]
