@@ -154,9 +154,10 @@ pub fn parse(text: &str) -> (Document, Vec<Diagnostic>) {
 
     let root = xml.root_element();
 
-    doc.is_xacro = root.attributes().any(|a| {
-        (a.name() == "xmlns:xacro" || a.name().starts_with("xmlns:"))
-            && a.value().contains("xacro")
+    // roxmltree exposes `xmlns:*` declarations through `namespaces()`, not
+    // `attributes()`, so the old attribute-based detection was always false.
+    doc.is_xacro = root.namespaces().any(|n| {
+        n.name() == Some("xacro") || n.uri().contains("xacro")
     });
 
     for node in root.children() {

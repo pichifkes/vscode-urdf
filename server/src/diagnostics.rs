@@ -255,6 +255,24 @@ pub fn check(
                 ));
             }
         }
+
+        // Half-joints — URDF requires both <parent> and <child>. Without them
+        // the kinematic-tree analysis drops the edge and the endpoints look
+        // isolated. Flag the joint instead.
+        if joint.parent.is_none() {
+            diags.push(make_diag(
+                joint.range,
+                DiagnosticSeverity::ERROR,
+                format!("Joint '{}' is missing required <parent> element", joint.name),
+            ));
+        }
+        if joint.child.is_none() {
+            diags.push(make_diag(
+                joint.range,
+                DiagnosticSeverity::ERROR,
+                format!("Joint '{}' is missing required <child> element", joint.name),
+            ));
+        }
     }
 
     // 4. Duplicate link names
@@ -287,8 +305,9 @@ pub fn check(
 
     // 6. Kinematic tree: multiple roots, disconnected links, cycles.
     // `ws` lets us suppress "isolated"/"disconnected" diagnostics for links
-    // wired up by a joint living in another file.
-    if doc.links.len() > 1 {
+    // wired up by a joint living in another file. Runs whenever there are
+    // joints (cycles are possible with one link and one self-loop joint).
+    if !doc.links.is_empty() && !doc.joints.is_empty() {
         kinematic_tree_check(&doc, &mut diags, undef_severity, ws);
     }
 
@@ -470,71 +489,66 @@ fn kinematic_tree_check(
         }
     }
 
-    // DFS starting points = all links with no parent (roots + isolated).
-    let all_roots: Vec<&str> = doc.links.iter()
-        .filter(|l| !child_set.contains(l.name.as_str()))
-        .map(|l| l.name.as_str())
-        .collect();
-
-    // Iterative DFS: detect cycles and collect reachable links.
+    // DFS in two passes so pure cycles (no incoming-edge-free node) still get
+    // detected. Pass 1 seeds from roots — finds cycles reachable from a root.
+    // Pass 2 seeds from any link the first pass didn't visit — that's only
+    // possible if it sits inside a pure cycle, since every non-cycle node is
+    // reachable from at least one root.
     let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut on_path: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut stack: Vec<(&str, usize)> = Vec::new();
+    let mut reported_cycle_joints: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
-    for &root in &all_roots {
-        if visited.contains(root) {
-            continue;
-        }
-        stack.push((root, 0));
-        on_path.insert(root);
+    let pass1_seeds: Vec<&str> = doc.links.iter()
+        .filter(|l| !child_set.contains(l.name.as_str()))
+        .map(|l| l.name.as_str())
+        .collect();
+    let pass2_seeds: Vec<&str> = doc.links.iter()
+        .map(|l| l.name.as_str())
+        .collect();
 
-        while !stack.is_empty() {
-            let last = stack.len() - 1;
-            let (node, idx) = stack[last];
-            let kids: &[&str] = adj.get(node).map(|v| v.as_slice()).unwrap_or(&[]);
+    for seeds in [pass1_seeds, pass2_seeds] {
+        for &seed in &seeds {
+            if visited.contains(seed) {
+                continue;
+            }
+            stack.push((seed, 0));
+            on_path.insert(seed);
 
-            if idx < kids.len() {
-                stack[last].1 += 1;
-                let kid = kids[idx];
+            while !stack.is_empty() {
+                let last = stack.len() - 1;
+                let (node, idx) = stack[last];
+                let kids: &[&str] = adj.get(node).map(|v| v.as_slice()).unwrap_or(&[]);
 
-                if on_path.contains(kid) {
-                    // Back edge — report the joint that closes the cycle.
-                    if let Some(joint) = doc.joints.iter().find(|j| {
-                        j.parent.as_ref().map_or(false, |p| p.name == node)
-                            && j.child.as_ref().map_or(false, |c| c.name == kid)
-                    }) {
-                        diags.push(make_diag(
-                            joint.range,
-                            DiagnosticSeverity::ERROR,
-                            format!("Joint '{}' creates a cycle in the kinematic tree", joint.name),
-                        ));
+                if idx < kids.len() {
+                    stack[last].1 += 1;
+                    let kid = kids[idx];
+
+                    if on_path.contains(kid) {
+                        // Back edge — report the joint that closes the cycle, once.
+                        if let Some((j_idx, joint)) = doc.joints.iter().enumerate().find(|(_, j)| {
+                            j.parent.as_ref().map_or(false, |p| p.name == node)
+                                && j.child.as_ref().map_or(false, |c| c.name == kid)
+                        }) {
+                            if reported_cycle_joints.insert(j_idx) {
+                                diags.push(make_diag(
+                                    joint.range,
+                                    DiagnosticSeverity::ERROR,
+                                    format!("Joint '{}' creates a cycle in the kinematic tree", joint.name),
+                                ));
+                            }
+                        }
+                    } else if !visited.contains(kid) {
+                        on_path.insert(kid);
+                        stack.push((kid, 0));
                     }
-                } else if !visited.contains(kid) {
-                    on_path.insert(kid);
-                    stack.push((kid, 0));
+                } else {
+                    visited.insert(node);
+                    on_path.remove(node);
+                    stack.pop();
                 }
-            } else {
-                visited.insert(node);
-                on_path.remove(node);
-                stack.pop();
             }
         }
-    }
-
-    // Links not reachable from any root are disconnected — unless a joint in
-    // another file wires this link into a larger tree we can't see locally.
-    for link in &doc.links {
-        if visited.contains(link.name.as_str()) {
-            continue;
-        }
-        if ws.is_some_and(|w| w.link_touched_by_joint(&link.name)) {
-            continue;
-        }
-        diags.push(make_diag(
-            link.range,
-            severity,
-            format!("Link '{}' is not connected to the kinematic tree", link.name),
-        ));
     }
 }
 

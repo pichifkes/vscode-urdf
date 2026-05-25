@@ -11,6 +11,9 @@ mod features;
 mod workspace;
 mod xacro_eval;
 
+#[cfg(test)]
+mod stress;
+
 use workspace::{FileSummary, WorkspaceIndex};
 
 // ── Workspace file scanner ───────────────────────────────────────────────────
